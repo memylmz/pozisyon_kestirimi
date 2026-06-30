@@ -1,0 +1,17 @@
+# Python cache dosyaları
+__pycache__/
+*.py[cod]
+
+# Sanal ortam
+.venv/
+venv/
+env/
+
+# Ortam değişkenleri
+.env
+
+# PyCharm ayarları
+.idea/
+
+# macOS dosyaları
+.DS_Store
