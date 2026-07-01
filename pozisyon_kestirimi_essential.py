@@ -55,12 +55,12 @@ def select_camera_calibration(frame_w, frame_h):
     return best, sx, sy, same_aspect
 
 
-cap = cv2.VideoCapture("/Users/mehmetyilmaz/Desktop/THYZ_2026_Ornek_Veri_1.MP4")
-#cap = cv2.VideoCapture("/Users/mehmetyilmaz/Desktop/2025_HYZ_Ornek_Veriler/Ornek_Veri_Gunduz_Kamera_VO.MP4")
+#cap = cv2.VideoCapture("/Users/mehmetyilmaz/Desktop/THYZ_2026_Ornek_Veri_1.MP4")
+cap = cv2.VideoCapture("/Users/mehmetyilmaz/Desktop/2025_HYZ_Ornek_Veriler/Ornek_Veri_Gunduz_Kamera_VO.MP4")
 
 lk_params = dict(
-    winSize=(21, 21),
-    maxLevel=4,
+    winSize=(15, 15),
+    maxLevel=3,
     criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
 )
 
@@ -130,6 +130,8 @@ arrow_tip_length = 0.45
 arrow_scale = 3.0
 min_motion_threshold = 0.5
 min_essential_points = 8
+fb_error_threshold = 1.5
+affine_ransac_threshold = 3.0
 
 # Essential matrix ile bulunan göreli pozlar ölçek belirsizdir.
 # scale_factor gerçek bir ölçümle kalibre edilirse poz birimi anlamlı hale gelir.
@@ -158,12 +160,39 @@ while True:
         old_gray = frame_gray.copy()
         continue
 
-    good_new = p1[st == 1]
-    good_old = p0[st == 1]   # sabit grid merkezleri
+    p0_back, st_back, err_back = cv2.calcOpticalFlowPyrLK(frame_gray, old_gray, p1, None, **lk_params)
+    if p0_back is None or st_back is None:
+        old_gray = frame_gray.copy()
+        continue
+
+    fb_error = np.linalg.norm(p0 - p0_back, axis=2)
+    valid_flow = (st.ravel() == 1) & (st_back.ravel() == 1) & (fb_error.ravel() < fb_error_threshold)
+    fb_count = int(np.count_nonzero(valid_flow))
+
+    good_new = p1[valid_flow]
+    good_old = p0[valid_flow]   # sabit grid merkezleri
 
     if len(good_new) < min_essential_points:
         old_gray = frame_gray.copy()
         continue
+
+    affine_matrix, affine_mask = cv2.estimateAffinePartial2D(
+        good_old,
+        good_new,
+        method=cv2.RANSAC,
+        ransacReprojThreshold=affine_ransac_threshold
+    )
+    if affine_matrix is not None and affine_mask is not None:
+        affine_inliers = affine_mask.ravel() == 1
+        good_old = good_old[affine_inliers]
+        good_new = good_new[affine_inliers]
+    affine_count = len(good_new)
+
+    if len(good_new) < min_essential_points:
+        old_gray = frame_gray.copy()
+        continue
+
+    
 
     flows = []
 
@@ -215,21 +244,26 @@ while True:
     )
 
     inlier_count = 0
+    essential_inliers = 0
     if E is not None and inlier_mask is not None:
+        essential_inliers = int(np.count_nonzero(inlier_mask))
         if E.shape != (3, 3):
             E = E[:3, :3]
 
         _, R, t, pose_mask = cv2.recoverPose(E, good_old, good_new, K, mask=inlier_mask)
         inlier_count = int(np.count_nonzero(pose_mask))
 
-        # Yeni göreli pozu dünya/kamera başlangıç koordinatına ekle.
-        global_t = global_t + global_R @ (t * scale_factor)
-        global_R = R @ global_R
+        if inlier_count >= min_essential_points:
+            # Yeni göreli pozu dünya/kamera başlangıç koordinatına ekle.
+            global_t = global_t + global_R @ (t * scale_factor)
+            global_R = R @ global_R
 
-        pose_text = (
-            f"t dir x:{t[0, 0]:.2f} y:{t[1, 0]:.2f} z:{t[2, 0]:.2f} "
-            f"inliers:{inlier_count}"
-        )
+            pose_text = (
+                f"t dir x:{t[0, 0]:.2f} y:{t[1, 0]:.2f} z:{t[2, 0]:.2f} "
+                f"inliers:{inlier_count}"
+            )
+        else:
+            pose_text = f"Pose skipped: low inliers:{inlier_count}"
 
 
     curr_time = time.time()
@@ -247,6 +281,8 @@ while True:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 0), 2)
     cv2.putText(frame, f"pos x:{global_t[0, 0]:.2f} y:{global_t[1, 0]:.2f} z:{global_t[2, 0]:.2f}", (20, 175),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 0), 2)
+    cv2.putText(frame, f"pts fb:{fb_count} aff:{affine_count} E:{essential_inliers} pose:{inlier_count}", (20, 210),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
     
 
 
