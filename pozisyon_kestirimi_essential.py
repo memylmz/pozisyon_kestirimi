@@ -3,7 +3,7 @@ import cv2
 import time
 
 # bize gelen kamera veirlerine gör euygun kamera paremetrelerini seçeceğiz ve ona göre işlem yapacağız.
-RGB_CALIBRATIONS = [
+CALIBRATIONS = [
     {
         "name": "RGB 1080p",
         "h": 1080,
@@ -25,17 +25,28 @@ RGB_CALIBRATIONS = [
             [0.0, 0.0, 1.0]
         ], dtype=np.float32),
         "dist": np.array([0.0798, -0.1867, 0.0, 0.0, 0.0], dtype=np.float32)
-    }
+    },
+    {
+    "name": "Thermal 640x512",
+    "h": 512,
+    "w": 640,
+    "K": np.array([
+        [731.7965, 0.0, 319.2367],
+        [0.0, 732.0172, 251.2424],
+        [0.0, 0.0, 1.0]
+    ], dtype=np.float32),
+    "dist": np.array([-0.3507, 0.1137, 0.0, 0.0, 0.0], dtype=np.float32)
+}
 ]
 
 def select_camera_calibration(frame_w, frame_h):
-    for calib in RGB_CALIBRATIONS:
+    for calib in CALIBRATIONS:
         if frame_w == calib["w"] and frame_h == calib["h"]:
             return calib, 1.0, 1.0, True
 
     frame_ratio = frame_w / frame_h
     best = min(
-        RGB_CALIBRATIONS,
+        CALIBRATIONS,
         key=lambda calib: abs(frame_ratio - (calib["w"] / calib["h"]))
     )
     sx = frame_w / best["w"]
@@ -44,8 +55,8 @@ def select_camera_calibration(frame_w, frame_h):
     return best, sx, sy, same_aspect
 
 
-#cap = cv2.VideoCapture("/Users/mehmetyilmaz/Desktop/THYZ_2026_Ornek_Veri_1.MP4")
-cap = cv2.VideoCapture("/Users/mehmetyilmaz/Desktop/2025_HYZ_Ornek_Veriler/Ornek_Veri_Gunduz_Kamera_VO.MP4")
+cap = cv2.VideoCapture("/Users/mehmetyilmaz/Desktop/THYZ_2026_Ornek_Veri_1.MP4")
+#cap = cv2.VideoCapture("/Users/mehmetyilmaz/Desktop/2025_HYZ_Ornek_Veriler/Ornek_Veri_Gunduz_Kamera_VO.MP4")
 
 lk_params = dict(
     winSize=(21, 21),
@@ -89,7 +100,7 @@ old_frame = cv2.remap(old_frame, map1, map2, cv2.INTER_LINEAR)
 old_gray = cv2.cvtColor(old_frame, cv2.COLOR_BGR2GRAY)
 
 h, w = old_gray.shape
-grid_size = 50
+grid_size = 60
 
 def create_grid_points():# grid noktaları oluşturmaya yarayan fonksiyon
     points = []
@@ -118,6 +129,14 @@ arrow_thickness = 3
 arrow_tip_length = 0.45
 arrow_scale = 3.0
 min_motion_threshold = 0.5
+min_essential_points = 8
+
+# Essential matrix ile bulunan göreli pozlar ölçek belirsizdir.
+# scale_factor gerçek bir ölçümle kalibre edilirse poz birimi anlamlı hale gelir.
+scale_factor = 1.0
+global_R = np.eye(3, dtype=np.float64)
+global_t = np.zeros((3, 1), dtype=np.float64)
+pose_text = "Pose: waiting"
 
 
 prev_time = time.time()
@@ -142,7 +161,7 @@ while True:
     good_new = p1[st == 1]
     good_old = p0[st == 1]   # sabit grid merkezleri
 
-    if len(good_new) < 5:
+    if len(good_new) < min_essential_points:
         old_gray = frame_gray.copy()
         continue
 
@@ -186,6 +205,31 @@ while True:
     dx_px = np.median(flows[:, 0]) # bütün noktaların dx bunların medianı
     dy_px = np.median(flows[:, 1])# bütün noktaların dy bunların medianı alınıyor ve genel hareket hesaplanıyır
 
+    E, inlier_mask = cv2.findEssentialMat(
+        good_old,
+        good_new,
+        K,
+        method=cv2.RANSAC,
+        prob=0.999,
+        threshold=1.0
+    )
+
+    inlier_count = 0
+    if E is not None and inlier_mask is not None:
+        if E.shape != (3, 3):
+            E = E[:3, :3]
+
+        _, R, t, pose_mask = cv2.recoverPose(E, good_old, good_new, K, mask=inlier_mask)
+        inlier_count = int(np.count_nonzero(pose_mask))
+
+        # Yeni göreli pozu dünya/kamera başlangıç koordinatına ekle.
+        global_t = global_t + global_R @ (t * scale_factor)
+        global_R = R @ global_R
+
+        pose_text = (
+            f"t dir x:{t[0, 0]:.2f} y:{t[1, 0]:.2f} z:{t[2, 0]:.2f} "
+            f"inliers:{inlier_count}"
+        )
 
 
     curr_time = time.time()
@@ -199,6 +243,11 @@ while True:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
     cv2.putText(frame, f"FPS: {fps:.2f}", (20, 105),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    cv2.putText(frame, pose_text, (20, 140),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 0), 2)
+    cv2.putText(frame, f"pos x:{global_t[0, 0]:.2f} y:{global_t[1, 0]:.2f} z:{global_t[2, 0]:.2f}", (20, 175),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 0), 2)
+    
 
 
 
@@ -214,5 +263,3 @@ while True:
 
 cap.release()
 cv2.destroyAllWindows()
-
-
