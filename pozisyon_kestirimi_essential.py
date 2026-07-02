@@ -129,7 +129,7 @@ arrow_thickness = 3
 arrow_tip_length = 0.45
 arrow_scale = 3.0
 min_motion_threshold = 0.5
-min_essential_points = 8
+min_essential_points = 100
 fb_error_threshold = 1.5
 affine_ransac_threshold = 3.0
 
