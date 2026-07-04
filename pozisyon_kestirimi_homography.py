@@ -1,135 +1,17 @@
 import numpy as np
 import cv2
 import time
+import csv
+from yardımcı_fonksiyonlar_homography import write_homography_log
+from yardımcı_fonksiyonlar_homography import angle_scale_from_homography
+from yardımcı_fonksiyonlar_homography import select_camera_calibration
+from yardımcı_fonksiyonlar_homography import filter_by_homography_error
+from yardımcı_fonksiyonlar_homography import detect_features
+from yardımcı_fonksiyonlar_homography import create_sample_points
 
 
-# Bize gelen kamera verilerine göre uygun kamera parametrelerini seçeceğiz.
-CALIBRATIONS = [
-    {
-        "name": "RGB 1080p",
-        "h": 1080,
-        "w": 1920,
-        "K": np.array([
-            [1389.7, 0.0, 954.007],
-            [0.0, 1387.1, 558.896],
-            [0.0, 0.0, 1.0]
-        ], dtype=np.float32),
-        "dist": np.array([0.1378, -0.2564, 0.0, 0.0, 0.0], dtype=np.float32)
-    },
-    {
-        "name": "RGB 4K",
-        "h": 3000,
-        "w": 4000,
-        "K": np.array([
-            [2792.2, 0.0, 1988.0],
-            [0.0, 2795.2, 1562.2],
-            [0.0, 0.0, 1.0]
-        ], dtype=np.float32),
-        "dist": np.array([0.0798, -0.1867, 0.0, 0.0, 0.0], dtype=np.float32)
-    },
-    {
-        "name": "Thermal 640x512",
-        "h": 512,
-        "w": 640,
-        "K": np.array([
-            [731.7965, 0.0, 319.2367],
-            [0.0, 732.0172, 251.2424],
-            [0.0, 0.0, 1.0]
-        ], dtype=np.float32),
-        "dist": np.array([-0.3507, 0.1137, 0.0, 0.0, 0.0], dtype=np.float32)
-    }
-]
-def angle_scale_from_homography(H, w, h, line_len=100):
-    """
-    Homography'nin görüntü merkezindeki yatay bir çizgiyi
-    ne kadar döndürdüğünü ve ölçeklediğini hesaplar.
-    """
-
-    ref_points = np.array([
-        [[w / 2, h / 2]],
-        [[w / 2 + line_len, h / 2]]
-    ], dtype=np.float32)
-
-    warped_ref = cv2.perspectiveTransform(ref_points, H)
-
-    x1, y1 = warped_ref[0, 0]
-    x2, y2 = warped_ref[1, 0]
-
-    angle_rad = np.arctan2(y2 - y1, x2 - x1)
-    angle_deg = np.degrees(angle_rad)
-
-    scale = np.hypot(x2 - x1, y2 - y1) / line_len
-
-    return angle_deg, scale
 
 
-def select_camera_calibration(frame_w, frame_h):
-    for calib in CALIBRATIONS:
-        if frame_w == calib["w"] and frame_h == calib["h"]:
-            return calib, 1.0, 1.0, True
-
-    frame_ratio = frame_w / frame_h
-
-    best = min(
-        CALIBRATIONS,
-        key=lambda calib: abs(frame_ratio - (calib["w"] / calib["h"]))
-    )
-
-    sx = frame_w / best["w"]
-    sy = frame_h / best["h"]
-    same_aspect = abs(sx - sy) < 1e-3
-
-    return best, sx, sy, same_aspect
-
-
-def detect_features(gray):
-    """
-    Görüntü üzerinde takip edilebilir feature/köşe noktalarını bulur.
-    """
-    return cv2.goodFeaturesToTrack(
-        gray,
-        maxCorners=1000,
-        qualityLevel=0.01,
-        minDistance=10,
-        blockSize=7
-    )
-
-
-def filter_by_homography_error(H, old_pts, new_pts, max_error=2.5):
-    """
-    Homography ile eski noktaları yeni frame'e projekte eder.
-    Projeksiyon hatası büyük olan noktaları eler.
-    """
-    old_pts_reshaped = old_pts.reshape(-1, 1, 2)
-    projected = cv2.perspectiveTransform(old_pts_reshaped, H).reshape(-1, 2)
-
-    new_pts_2d = new_pts.reshape(-1, 2)
-
-    errors = np.linalg.norm(projected - new_pts_2d, axis=1)
-
-    valid = errors < max_error
-
-    return old_pts[valid], new_pts[valid], errors[valid]
-
-
-def create_sample_points(w, h):
-    """
-    Tek merkez noktası yerine görüntü üzerinde 9 nokta kullanıyoruz.
-    Böylece dönme/perspektif etkisine karşı daha dengeli hareket ölçülür.
-    """
-    return np.array([
-        [[w * 0.25, h * 0.25]],
-        [[w * 0.50, h * 0.25]],
-        [[w * 0.75, h * 0.25]],
-
-        [[w * 0.25, h * 0.50]],
-        [[w * 0.50, h * 0.50]],
-        [[w * 0.75, h * 0.50]],
-
-        [[w * 0.25, h * 0.75]],
-        [[w * 0.50, h * 0.75]],
-        [[w * 0.75, h * 0.75]],
-    ], dtype=np.float32)
 
 
 # Video yolu
@@ -230,6 +112,28 @@ homography_text = "Homography: waiting"
 
 prev_time = time.time()
 
+log_file = open("homography_features.csv", "w", newline="", encoding="utf-8")
+log_writer = csv.writer(log_file)
+log_writer.writerow([
+    "frame_index",
+    "status",
+    #"dx_px",
+    #"dy_px",
+    #"dx_h",
+    #"dy_h",
+    #"angle_deg",
+    #"scale",
+    "global_dx_px",
+    "global_dy_px",
+    "global_angle_deg",
+    "global_scale",
+    #"fb_count",
+    #"homography_inliers",
+    #"clean_inliers"
+])
+
+frame_index = 1
+
 
 while True:
     ret, frame = cap.read()
@@ -244,6 +148,16 @@ while True:
         p0 = detect_features(old_gray)
 
         if p0 is None:
+            write_homography_log(
+                log_writer,
+                frame_index,
+                "no_features",
+                global_dx_px=global_dx_px,
+                global_dy_px=global_dy_px,
+                global_angle_deg=global_angle_deg,
+                global_scale=global_scale
+            )
+            frame_index += 1
             old_gray = frame_gray.copy()
             continue
 
@@ -257,6 +171,16 @@ while True:
     )
 
     if p1 is None or st is None:
+        write_homography_log(
+            log_writer,
+            frame_index,
+            "optical_flow_failed",
+            global_dx_px=global_dx_px,
+            global_dy_px=global_dy_px,
+            global_angle_deg=global_angle_deg,
+            global_scale=global_scale
+        )
+        frame_index += 1
         old_gray = frame_gray.copy()
         p0 = detect_features(old_gray)
         continue
@@ -271,6 +195,16 @@ while True:
     )
 
     if p0_back is None or st_back is None:
+        write_homography_log(
+            log_writer,
+            frame_index,
+            "backward_flow_failed",
+            global_dx_px=global_dx_px,
+            global_dy_px=global_dy_px,
+            global_angle_deg=global_angle_deg,
+            global_scale=global_scale
+        )
+        frame_index += 1
         old_gray = frame_gray.copy()
         p0 = detect_features(old_gray)
         continue
@@ -289,6 +223,17 @@ while True:
     good_new = p1[valid_flow]
 
     if len(good_new) < min_homography_points:
+        write_homography_log(
+            log_writer,
+            frame_index,
+            "low_tracked_points",
+            global_dx_px=global_dx_px,
+            global_dy_px=global_dy_px,
+            global_angle_deg=global_angle_deg,
+            global_scale=global_scale,
+            fb_count=fb_count
+        )
+        frame_index += 1
         old_gray = frame_gray.copy()
         p0 = detect_features(old_gray)
         continue
@@ -330,6 +275,7 @@ while True:
     dy_h = 0.0
     angle_deg = 0.0
     scale = 1.0
+    homography_status = "failed"
 
     # Homography hesapla
     H_frame, H_mask = cv2.findHomography(
@@ -401,12 +347,15 @@ while True:
                     f"ang:{angle_deg:.2f} scale:{scale:.3f} "
                     f"in:{homography_inliers} clean:{clean_inliers}"
                 )
+                homography_status = "ok"
 
             else:
                 homography_text = "H refine failed"
+                homography_status = "refine_failed"
 
         else:
             homography_text = f"H skipped clean:{clean_inliers}"
+            homography_status = "low_clean_inliers"
 
     else:
         homography_text = "H failed"
@@ -416,6 +365,26 @@ while True:
     dt = curr_time - prev_time
     fps = 1.0 / dt if dt > 0 else 0.0
     prev_time = curr_time
+
+    write_homography_log(
+        log_writer,
+        frame_index,
+        homography_status,
+        #dx_px=dx_px,
+        #dy_px=dy_px,
+        #dx_h=dx_h,
+        #dy_h=dy_h,
+        #angle_deg=angle_deg,
+        #scale=scale,
+        global_dx_px=global_dx_px,
+        global_dy_px=global_dy_px,
+        global_angle_deg=global_angle_deg,
+        global_scale=global_scale,
+        #fb_count=fb_count,
+        #homography_inliers=homography_inliers,
+        #clean_inliers=clean_inliers
+    )
+    frame_index += 1
 
     # Ekrana yazdırma
     cv2.putText(
@@ -502,6 +471,6 @@ while True:
         homography_text = "No features"
         continue
 
-
+log_file.close()
 cap.release()
 cv2.destroyAllWindows()
