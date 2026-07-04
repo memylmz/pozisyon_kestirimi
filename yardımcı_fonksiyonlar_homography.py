@@ -15,6 +15,7 @@ def write_homography_log(
     global_dy_px=0.0,
     global_angle_deg=0.0,
     global_scale=1.0,
+    **_unused_metrics
     #fb_count=0,
     #homography_inliers=0,
     #clean_inliers=0

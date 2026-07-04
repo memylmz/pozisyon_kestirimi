@@ -112,6 +112,16 @@ homography_text = "Homography: waiting"
 
 prev_time = time.time()
 
+map_w = 300
+map_h = 300
+map_center_x = map_w // 2
+map_center_y = map_h // 2
+draw_scale = 1.0
+trajectory = [(0.0, 0.0)]
+map_x_px = 0.0
+map_y_px = 0.0
+map_heading_deg = 0.0
+
 log_file = open("homography_features.csv", "w", newline="", encoding="utf-8")
 log_writer = csv.writer(log_file)
 log_writer.writerow([
@@ -457,7 +467,91 @@ while True:
     2
 )
 
+    if homography_status == "ok":
+        heading_rad = np.deg2rad(map_heading_deg)
+        rotated_dx = dx_h * np.cos(heading_rad) - dy_h * np.sin(heading_rad)
+        rotated_dy = dx_h * np.sin(heading_rad) + dy_h * np.cos(heading_rad)
+
+        map_x_px += rotated_dx
+        map_y_px += rotated_dy
+        map_heading_deg += angle_deg
+
+        if map_heading_deg > 180.0:
+            map_heading_deg -= 360.0
+        elif map_heading_deg < -180.0:
+            map_heading_deg += 360.0
+
+        trajectory.append((map_x_px, map_y_px))
+
+    traj_map = np.zeros((map_h, map_w, 3), dtype=np.uint8)
+    current_draw_scale = draw_scale
+
+    if len(trajectory) > 1:
+        traj_xs = [p[0] for p in trajectory]
+        traj_ys = [p[1] for p in trajectory]
+        max_abs_x = max(abs(min(traj_xs)), abs(max(traj_xs)), 1.0)
+        max_abs_y = max(abs(min(traj_ys)), abs(max(traj_ys)), 1.0)
+        usable_half = min(map_w, map_h) * 0.45
+        current_draw_scale = min(draw_scale, usable_half / max(max_abs_x, max_abs_y))
+
+    cv2.line(traj_map, (0, map_center_y), (map_w, map_center_y), (80, 80, 80), 1)
+    cv2.line(traj_map, (map_center_x, 0), (map_center_x, map_h), (80, 80, 80), 1)
+
+    cv2.circle(traj_map, (map_center_x, map_center_y), 4, (0, 255, 255), -1)
+    cv2.putText(
+        traj_map,
+        "(0,0)",
+        (map_center_x + 5, map_center_y - 5),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.4,
+        (0, 255, 255),
+        1
+    )
+
+    for i in range(1, len(trajectory)):
+        x1, y1 = trajectory[i - 1]
+        x2, y2 = trajectory[i]
+
+        px1 = int(map_center_x + x1 * current_draw_scale)
+        py1 = int(map_center_y - y1 * current_draw_scale)
+        px2 = int(map_center_x + x2 * current_draw_scale)
+        py2 = int(map_center_y - y2 * current_draw_scale)
+
+        if 0 <= px1 < map_w and 0 <= py1 < map_h and 0 <= px2 < map_w and 0 <= py2 < map_h:
+            cv2.line(traj_map, (px1, py1), (px2, py2), (0, 0, 255), 2)
+
+    last_x, last_y = trajectory[-1]
+    last_px = int(map_center_x + last_x * current_draw_scale)
+    last_py = int(map_center_y - last_y * current_draw_scale)
+
+    if 0 <= last_px < map_w and 0 <= last_py < map_h:
+        cv2.circle(traj_map, (last_px, last_py), 4, (255, 0, 0), -1)
+
+        heading_rad = np.deg2rad(map_heading_deg)
+        arrow_len = 30
+        heading_end_x = int(last_px + arrow_len * np.cos(heading_rad))
+        heading_end_y = int(last_py - arrow_len * np.sin(heading_rad))
+        cv2.arrowedLine(
+            traj_map,
+            (last_px, last_py),
+            (heading_end_x, heading_end_y),
+            (0, 255, 0),
+            2,
+            tipLength=0.35
+        )
+
+    cv2.putText(
+        traj_map,
+        f"x:{last_x:.1f}px y:{last_y:.1f}px head:{map_heading_deg:.1f}",
+        (15, 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (255, 255, 255),
+        1
+    )
+
     cv2.imshow("frame", frame)
+    cv2.imshow("trajectory", traj_map)
 
     k = cv2.waitKey(30) & 0xff
     if k == 27:
