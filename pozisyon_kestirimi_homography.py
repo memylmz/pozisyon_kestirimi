@@ -1,13 +1,7 @@
 import numpy as np
 import cv2
 import time
-import csv
-from yardımcı_fonksiyonlar_homography import write_homography_log
-from yardımcı_fonksiyonlar_homography import angle_scale_from_homography
-from yardımcı_fonksiyonlar_homography import select_camera_calibration
-from yardımcı_fonksiyonlar_homography import filter_by_homography_error
-from yardımcı_fonksiyonlar_homography import detect_features
-from yardımcı_fonksiyonlar_homography import create_sample_points
+from yardımcı_fonksiyonlar_homography import *
 
 
 
@@ -97,6 +91,11 @@ min_homography_points = 30
 fb_error_threshold = 1.5
 homography_ransac_threshold = 3.0
 homography_reprojection_error = 2.5
+affine_ransac_threshold = 3.0
+
+z_deadzone = 0.0002
+z_smoothing_alpha = 0.25
+z_direction = -1.0
 
 
 # Global Homography
@@ -107,8 +106,11 @@ global_dy_px = 0.0
 
 global_angle_deg = 0.0
 global_scale = 1.0
+z_position_unscaled = 0.0
+filtered_z_delta_unscaled = 0.0
 
 homography_text = "Homography: waiting"
+z_text = "Z unscaled: 0.00000"
 
 prev_time = time.time()
 
@@ -121,28 +123,8 @@ trajectory = [(0.0, 0.0)]
 map_x_px = 0.0
 map_y_px = 0.0
 map_heading_deg = 0.0
-
-log_file = open("homography_features.csv", "w", newline="", encoding="utf-8")
-log_writer = csv.writer(log_file)
-log_writer.writerow([
-    "frame_index",
-    "status",
-    #"dx_px",
-    #"dy_px",
-    #"dx_h",
-    #"dy_h",
-    #"angle_deg",
-    #"scale",
-    "global_dx_px",
-    "global_dy_px",
-    "global_angle_deg",
-    "global_scale",
-    #"fb_count",
-    #"homography_inliers",
-    #"clean_inliers"
-])
-
-frame_index = 1
+heading_deadband_deg = 0.1
+windows_positioned = False
 
 
 while True:
@@ -158,16 +140,6 @@ while True:
         p0 = detect_features(old_gray)
 
         if p0 is None:
-            write_homography_log(
-                log_writer,
-                frame_index,
-                "no_features",
-                global_dx_px=global_dx_px,
-                global_dy_px=global_dy_px,
-                global_angle_deg=global_angle_deg,
-                global_scale=global_scale
-            )
-            frame_index += 1
             old_gray = frame_gray.copy()
             continue
 
@@ -181,16 +153,6 @@ while True:
     )
 
     if p1 is None or st is None:
-        write_homography_log(
-            log_writer,
-            frame_index,
-            "optical_flow_failed",
-            global_dx_px=global_dx_px,
-            global_dy_px=global_dy_px,
-            global_angle_deg=global_angle_deg,
-            global_scale=global_scale
-        )
-        frame_index += 1
         old_gray = frame_gray.copy()
         p0 = detect_features(old_gray)
         continue
@@ -205,16 +167,6 @@ while True:
     )
 
     if p0_back is None or st_back is None:
-        write_homography_log(
-            log_writer,
-            frame_index,
-            "backward_flow_failed",
-            global_dx_px=global_dx_px,
-            global_dy_px=global_dy_px,
-            global_angle_deg=global_angle_deg,
-            global_scale=global_scale
-        )
-        frame_index += 1
         old_gray = frame_gray.copy()
         p0 = detect_features(old_gray)
         continue
@@ -233,17 +185,6 @@ while True:
     good_new = p1[valid_flow]
 
     if len(good_new) < min_homography_points:
-        write_homography_log(
-            log_writer,
-            frame_index,
-            "low_tracked_points",
-            global_dx_px=global_dx_px,
-            global_dy_px=global_dy_px,
-            global_angle_deg=global_angle_deg,
-            global_scale=global_scale,
-            fb_count=fb_count
-        )
-        frame_index += 1
         old_gray = frame_gray.copy()
         p0 = detect_features(old_gray)
         continue
@@ -286,6 +227,19 @@ while True:
     angle_deg = 0.0
     scale = 1.0
     homography_status = "failed"
+
+    affine_depth_signal, affine_image_scale, affine_inliers = affine_depth_from_points(
+        good_old,
+        good_new,
+        ransac_threshold=affine_ransac_threshold
+    )
+
+    radial_depth_signal, radial_depth_count = radial_depth_from_points(
+        good_old,
+        good_new,
+        w,
+        h
+    )
 
     # Homography hesapla
     H_frame, H_mask = cv2.findHomography(
@@ -370,31 +324,27 @@ while True:
     else:
         homography_text = "H failed"
 
+    raw_z_delta = radial_depth_signal
+    if not np.isfinite(raw_z_delta):
+        raw_z_delta = affine_depth_signal
+
+    if np.isfinite(raw_z_delta) and abs(raw_z_delta) >= z_deadzone:
+        z_delta_unscaled = z_direction * raw_z_delta
+    else:
+        z_delta_unscaled = 0.0
+
+    filtered_z_delta_unscaled = (
+        (1.0 - z_smoothing_alpha) * filtered_z_delta_unscaled +
+        z_smoothing_alpha * z_delta_unscaled
+    )
+    z_position_unscaled += filtered_z_delta_unscaled
+    z_text = f"Z unscaled: {z_position_unscaled:.5f}"
+
     # FPS hesabı
     curr_time = time.time()
     dt = curr_time - prev_time
     fps = 1.0 / dt if dt > 0 else 0.0
     prev_time = curr_time
-
-    write_homography_log(
-        log_writer,
-        frame_index,
-        homography_status,
-        #dx_px=dx_px,
-        #dy_px=dy_px,
-        #dx_h=dx_h,
-        #dy_h=dy_h,
-        #angle_deg=angle_deg,
-        #scale=scale,
-        global_dx_px=global_dx_px,
-        global_dy_px=global_dy_px,
-        global_angle_deg=global_angle_deg,
-        global_scale=global_scale,
-        #fb_count=fb_count,
-        #homography_inliers=homography_inliers,
-        #clean_inliers=clean_inliers
-    )
-    frame_index += 1
 
     # Ekrana yazdırma
     cv2.putText(
@@ -467,6 +417,16 @@ while True:
     2
 )
 
+    cv2.putText(
+        frame,
+        z_text,
+        (20, 280),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.75,
+        (0, 255, 180),
+        2
+    )
+
     if homography_status == "ok":
         heading_rad = np.deg2rad(map_heading_deg)
         rotated_dx = dx_h * np.cos(heading_rad) - dy_h * np.sin(heading_rad)
@@ -474,7 +434,9 @@ while True:
 
         map_x_px += rotated_dx
         map_y_px += rotated_dy
-        map_heading_deg += angle_deg
+
+        if abs(angle_deg) > heading_deadband_deg:
+            map_heading_deg += angle_deg
 
         if map_heading_deg > 180.0:
             map_heading_deg -= 360.0
@@ -552,6 +514,11 @@ while True:
 
     cv2.imshow("frame", frame)
     cv2.imshow("trajectory", traj_map)
+
+    if not windows_positioned:
+        cv2.moveWindow("frame", 40, 40)
+        cv2.moveWindow("trajectory", w + 80, 40)
+        windows_positioned = True
 
     k = cv2.waitKey(30) & 0xff
     if k == 27:

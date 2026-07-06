@@ -1,43 +1,6 @@
 import cv2
 import numpy as np
 
-def write_homography_log(
-    writer,
-    frame_index,
-    status,
-    #dx_px=0.0,
-    #dy_px=0.0,
-    #dx_h=0.0,
-    #dy_h=0.0,
-    #angle_deg=0.0,
-    #scale=1.0,
-    global_dx_px=0.0,
-    global_dy_px=0.0,
-    global_angle_deg=0.0,
-    global_scale=1.0,
-    **_unused_metrics
-    #fb_count=0,
-    #homography_inliers=0,
-    #clean_inliers=0
-):
-    writer.writerow([
-        frame_index,
-        status,
-        #dx_px,
-        #dy_px,
-        #dx_h,
-        #dy_h,
-        #angle_deg,
-        #scale,
-        global_dx_px,
-        global_dy_px,
-        global_angle_deg,
-        global_scale,
-        #fb_count,
-        #homography_inliers,
-        #clean_inliers
-    ])
-
 
 def angle_scale_from_homography(H, w, h, line_len=100):
     """
@@ -61,6 +24,150 @@ def angle_scale_from_homography(H, w, h, line_len=100):
     scale = np.hypot(x2 - x1, y2 - y1) / line_len
 
     return angle_deg, scale
+
+
+def affine_depth_from_points(old_pts, new_pts, ransac_threshold=3.0):
+    """
+    Görüntüdeki genel büyüme/küçülmeyi similarity ölçeğiyle ölçer.
+    log(scale) > 0 görüntünün büyüdüğünü, < 0 küçüldüğünü gösterir.
+    """
+    if len(old_pts) < 3 or len(new_pts) < 3:
+        return np.nan, np.nan, 0
+
+    affine_matrix, affine_mask = cv2.estimateAffinePartial2D(
+        old_pts,
+        new_pts,
+        method=cv2.RANSAC,
+        ransacReprojThreshold=ransac_threshold
+    )
+
+    if affine_matrix is None:
+        return np.nan, np.nan, 0
+
+    a = affine_matrix[0, 0]
+    b = affine_matrix[0, 1]
+    image_scale = float(np.sqrt(a * a + b * b))
+
+    if image_scale <= 0:
+        return np.nan, np.nan, 0
+
+    inliers = int(np.count_nonzero(affine_mask)) if affine_mask is not None else len(old_pts)
+    return float(np.log(image_scale)), image_scale, inliers
+
+
+def radial_depth_from_points(old_pts, new_pts, w, h, min_radius=30.0):
+    """
+    Takip edilen noktalar merkezden dışarı açılıyor mu, merkeze mi kapanıyor ölçer.
+    Pozitif değer görüntü genişlemesini, negatif değer görüntü daralmasını gösterir.
+    """
+    if len(old_pts) < 3 or len(new_pts) < 3:
+        return np.nan, 0
+
+    old_2d = old_pts.reshape(-1, 2).astype(np.float64)
+    new_2d = new_pts.reshape(-1, 2).astype(np.float64)
+
+    center = np.array([w / 2.0, h / 2.0], dtype=np.float64)
+    radial_vectors = old_2d - center
+    radius_sq = np.sum(radial_vectors * radial_vectors, axis=1)
+    valid = radius_sq > (min_radius * min_radius)
+
+    if np.count_nonzero(valid) < 3:
+        return np.nan, int(np.count_nonzero(valid))
+
+    flows = new_2d - old_2d
+    translation = np.median(flows[valid], axis=0)
+    residual_flows = flows - translation
+
+    radial_scale_change = (
+        np.sum(residual_flows[valid] * radial_vectors[valid], axis=1) /
+        radius_sq[valid]
+    )
+
+    return float(np.median(radial_scale_change)), int(np.count_nonzero(valid))
+
+
+def essential_z_from_points(old_pts, new_pts, K, min_points=8, ransac_threshold=1.0):
+    """
+    Essential matrix üzerinden göreli translation yönünün z bileşenini üretir.
+    Ölçek içermez; sadece frame'ler arası ileri/geri yön sinyali olarak düşünülmelidir.
+    """
+    if len(old_pts) < min_points or len(new_pts) < min_points:
+        return np.nan, 0
+
+    E, inlier_mask = cv2.findEssentialMat(
+        old_pts,
+        new_pts,
+        K,
+        method=cv2.RANSAC,
+        prob=0.999,
+        threshold=ransac_threshold
+    )
+
+    if E is None or inlier_mask is None:
+        return np.nan, 0
+
+    if E.shape != (3, 3):
+        E = E[:3, :3]
+
+    _, _R, t, pose_mask = cv2.recoverPose(E, old_pts, new_pts, K, mask=inlier_mask)
+    inliers = int(np.count_nonzero(pose_mask)) if pose_mask is not None else 0
+
+    if inliers < min_points:
+        return np.nan, inliers
+
+    return float(t[2, 0]), inliers
+
+
+def homography_z_from_decomposition(H, K, previous_z=None):
+    """
+    Homography decomposition ile t/d vektörlerinin z bileşeninden sinyal üretir.
+    Birden fazla çözüm geldiği için önceki frame'e en yakın z adayı seçilir.
+    """
+    retval, _Rs, ts, _normals = cv2.decomposeHomographyMat(H, K)
+
+    if retval <= 0 or ts is None:
+        return np.nan, 0
+
+    z_candidates = np.array([float(t.reshape(3)[2]) for t in ts], dtype=np.float64)
+
+    if z_candidates.size == 0:
+        return np.nan, 0
+
+    if previous_z is not None and np.isfinite(previous_z):
+        best_index = int(np.argmin(np.abs(z_candidates - previous_z)))
+    else:
+        best_index = int(np.argmax(np.abs(z_candidates)))
+
+    return float(z_candidates[best_index]), int(z_candidates.size)
+
+
+def vote_depth_signals(signals, thresholds):
+    """
+    Sinyallerin işaretlerine göre 2/3 benzeri basit oylama yapar.
+    Pozitif/negatif yönün gerçek dünyadaki anlamı video üzerinde kalibre edilmelidir.
+    """
+    positive_votes = 0
+    negative_votes = 0
+
+    for name, value in signals.items():
+        threshold = thresholds.get(name, 0.0)
+
+        if value is None or not np.isfinite(value):
+            continue
+
+        if value > threshold:
+            positive_votes += 1
+        elif value < -threshold:
+            negative_votes += 1
+
+    if positive_votes >= 2:
+        vote = "positive"
+    elif negative_votes >= 2:
+        vote = "negative"
+    else:
+        vote = "uncertain"
+
+    return vote, positive_votes, negative_votes
 
 
 
