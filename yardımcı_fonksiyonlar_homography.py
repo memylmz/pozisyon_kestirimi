@@ -118,6 +118,50 @@ def essential_z_from_points(old_pts, new_pts, K, min_points=8, ransac_threshold=
     return float(t[2, 0]), inliers
 
 
+def essential_yaw_from_points(old_pts, new_pts, K, min_points=15, ransac_threshold=1.0):
+    """
+    Essential matrix + recoverPose ile kareler arası kameranın optik eksen (yaw)
+    dönmesini derece cinsinden verir. Homography'nin aksine düzlemsel olmayan
+    sahnede rotasyonu translation'dan (parallax) doğru ayırır; bu yüzden 3B yapı
+    üzerinde heading kaynağı olarak homography açısından daha güvenilirdir.
+
+    Uyarı: Sahne neredeyse tam düzlemsel + hareket küçükse essential matrix
+    dejenere olur; bu durumda çağıran tarafın homography açısına düşmesi beklenir.
+    """
+    if len(old_pts) < min_points or len(new_pts) < min_points:
+        return np.nan, 0
+
+    E, inlier_mask = cv2.findEssentialMat(
+        old_pts,
+        new_pts,
+        K,
+        method=cv2.RANSAC,
+        prob=0.999,
+        threshold=ransac_threshold
+    )
+
+    if E is None or inlier_mask is None:
+        return np.nan, 0
+
+    if E.shape != (3, 3):
+        E = E[:3, :3]
+
+    _, R, _t, pose_mask = cv2.recoverPose(E, old_pts, new_pts, K, mask=inlier_mask)
+    inliers = int(np.count_nonzero(pose_mask)) if pose_mask is not None else 0
+
+    if inliers < min_points:
+        return np.nan, inliers
+
+    # Optik eksen (kamera Z) etrafındaki dönme = yaw. Rodrigues vektörünün Z bileşeni.
+    rvec, _ = cv2.Rodrigues(R)
+    yaw_deg = float(np.degrees(rvec[2, 0]))
+
+    if not np.isfinite(yaw_deg):
+        return np.nan, inliers
+
+    return yaw_deg, inliers
+
+
 def homography_z_from_decomposition(H, K, previous_z=None):
     """
     Homography decomposition ile t/d vektörlerinin z bileşeninden sinyal üretir.
