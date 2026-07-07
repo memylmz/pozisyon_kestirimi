@@ -466,6 +466,7 @@ z_text = "Z unscaled: 0.00000"
 
 prev_time = time.time()
 
+<<<<<<< HEAD
 # Harita çözünürlüğü: yol tüm alanı doldurunca küçük hareketler alt-piksel kalıp
 # görünmez oluyordu; büyüterek ince detay (küçük dönüş/hareket) görünür hale geliyor.
 map_w = 600
@@ -511,6 +512,12 @@ estimated_motion_file = open(ESTIMATED_MOTION_CSV, "w", newline="", encoding="ut
 estimated_motion_writer = csv.writer(estimated_motion_file)
 estimated_motion_writer.writerow([
     "frame",
+=======
+log_file = open("homography_features.csv", "w", newline="", encoding="utf-8")
+log_writer = csv.writer(log_file)
+log_writer.writerow([
+    "frame_index",
+>>>>>>> parent of cd5c7ec (dönme mantığında iyileştirmeler yapıldı ve trajectory haritası eklendi)
     "status",
     "map_x_px",
     "map_y_px",
@@ -952,6 +959,7 @@ while True:
     2
 )
 
+<<<<<<< HEAD
     cv2.putText(
         frame,
         z_text,
@@ -1171,6 +1179,9 @@ while True:
         cv2.moveWindow("frame", 40, 40)
         # cv2.moveWindow("trajectory", w + 80, 40)
         windows_positioned = True
+=======
+    cv2.imshow("frame", frame)
+>>>>>>> parent of cd5c7ec (dönme mantığında iyileştirmeler yapıldı ve trajectory haritası eklendi)
 
     k = cv2.waitKey(30) & 0xff
     if k == 27:

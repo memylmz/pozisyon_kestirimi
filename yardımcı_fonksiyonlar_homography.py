@@ -1,6 +1,45 @@
 import cv2
 import numpy as np
 
+<<<<<<< HEAD
+=======
+def write_homography_log(
+    writer,
+    frame_index,
+    status,
+    #dx_px=0.0,
+    #dy_px=0.0,
+    #dx_h=0.0,
+    #dy_h=0.0,
+    #angle_deg=0.0,
+    #scale=1.0,
+    global_dx_px=0.0,
+    global_dy_px=0.0,
+    global_angle_deg=0.0,
+    global_scale=1.0,
+    #fb_count=0,
+    #homography_inliers=0,
+    #clean_inliers=0
+):
+    writer.writerow([
+        frame_index,
+        status,
+        #dx_px,
+        #dy_px,
+        #dx_h,
+        #dy_h,
+        #angle_deg,
+        #scale,
+        global_dx_px,
+        global_dy_px,
+        global_angle_deg,
+        global_scale,
+        #fb_count,
+        #homography_inliers,
+        #clean_inliers
+    ])
+
+>>>>>>> parent of cd5c7ec (dönme mantığında iyileştirmeler yapıldı ve trajectory haritası eklendi)
 
 def angle_scale_from_homography(H, w, h, line_len=100):
     """
