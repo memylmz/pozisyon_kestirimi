@@ -55,8 +55,8 @@ def select_camera_calibration(frame_w, frame_h):
     return best, sx, sy, same_aspect
 
 
-#cap = cv2.VideoCapture("/Users/mehmetyilmaz/Desktop/THYZ_2026_Ornek_Veri_1.MP4")
-cap = cv2.VideoCapture("/Users/mehmetyilmaz/Desktop/2025_HYZ_Ornek_Veriler/Ornek_Veri_Gunduz_Kamera_VO.MP4")
+cap = cv2.VideoCapture("/Users/mehmetyilmaz/Desktop/THYZ_2026_Ornek_Veri_1.MP4")
+#cap = cv2.VideoCapture("/Users/mehmetyilmaz/Desktop/2025_HYZ_Ornek_Veriler/Ornek_Veri_Gunduz_Kamera_VO.MP4")
 
 lk_params = dict(
     winSize=(15, 15),
