@@ -2,147 +2,199 @@ import numpy as np
 import cv2
 import time
 import csv
-from yardımcı_fonksiyonlar_homography import write_homography_log
-from yardımcı_fonksiyonlar_homography import angle_scale_from_homography
-from yardımcı_fonksiyonlar_homography import select_camera_calibration
-from yardımcı_fonksiyonlar_homography import filter_by_homography_error
-from yardımcı_fonksiyonlar_homography import detect_features
-from yardımcı_fonksiyonlar_homography import create_sample_points
 
+import matplotlib.pyplot as plt
 
+from yardımcı_fonksiyonlar_homography import (
+    detect_features, select_camera_calibration, filter_by_homography_error
+)
+from kalibrasyon import (
+    load_gt_translations, fit_calibration, calibration_report,
+    apply_calibration, fit_altitude_from_vertical,
+    fit_z_calibration, apply_z_calibration, z_calibration_report
+)
 
+# -----------------------------------------------------------------------------
+# HOMOGRAFİ tabanlı monoküler VO + GT-CSV metrik kalibrasyon.
+#
+# Fark (affine similarity'ye göre): hareket keyframe -> current arasında
+# findHomography ile kestirilir; homografi düzlemsel perspektifi/eğimi doğru
+# modeller (RANSAC baskın yer-düzlemini bulur, düzlem-dışı noktaları eler).
+# Yaw/ölçek/öteleme, homografiyi OPTİK MERKEZDE lineerleştirerek çıkarılır
+# (kırılgan decomposeHomographyMat 4-çözüm belirsizliği YOK). Gerisi affine
+# hattıyla aynı: incremental LK, forward-backward, re-anchor'lı keyframe,
+# heading/ölçek/konum dead-reckoning ve GT ile tek-seferlik metrik hizalama.
+# -----------------------------------------------------------------------------
 
-
-
-# Video yolu
 cap = cv2.VideoCapture("/Users/mehmetyilmaz/Desktop/THYZ_2026_Ornek_Veri_1.MP4")
-#cap = cv2.VideoCapture(
-#    "/Users/mehmetyilmaz/Desktop/2025_HYZ_Ornek_Veriler/Ornek_Veri_Gunduz_Kamera_VO.MP4")
-
+#cap = cv2.VideoCapture("/Users/mehmetyilmaz/Desktop/Ornek-Veri-1-RGB.MP4")
 
 lk_params = dict(
-    winSize=(15, 15),
+    winSize=(21, 21),
     maxLevel=3,
     criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
 )
-
 
 ret, old_frame = cap.read()
 if not ret:
     raise RuntimeError("Video okunamadı.")
 
-
 h, w = old_frame.shape[:2]
 print("Frame shape:", old_frame.shape)
 
-
 selected_calib, sx, sy, same_aspect = select_camera_calibration(w, h)
-
 
 K = selected_calib["K"].copy()
 K[0, 0] *= sx   # fx
 K[0, 2] *= sx   # cx
 K[1, 1] *= sy   # fy
 K[1, 2] *= sy   # cy
-
 dist_coeffs = selected_calib["dist"]
-
 
 print("Selected calibration:", selected_calib["name"])
 print("scale_x:", sx)
 print("scale_y:", sy)
 print("Scaled K:\n", K)
 
-
 if not same_aspect:
-    print("UYARI: Video çözünürlüğü kayıtlı kalibrasyonlarla birebir veya aynı oranda eşleşmiyor.")
-    print("UYARI: En yakın kalibrasyon seçildi; crop/letterbox varsa K, undistortion ve hareket hesabı sapabilir.")
-
+    print("UYARI: Video çözünürlüğü kayıtlı kalibrasyonlarla birebir/aynı oranda eşleşmiyor.")
+    print("UYARI: En yakın kalibrasyon seçildi; crop/letterbox varsa K ve hesaplar sapabilir.")
 
 # Undistortion haritasını bir kez hesapla
 map1, map2 = cv2.initUndistortRectifyMap(
-    K,
-    dist_coeffs,
-    None,
-    K,
-    (w, h),
-    cv2.CV_16SC2
+    K, dist_coeffs, None, K, (w, h), cv2.CV_16SC2
 )
-
 
 old_frame = cv2.remap(old_frame, map1, map2, cv2.INTER_LINEAR)
 old_gray = cv2.cvtColor(old_frame, cv2.COLOR_BGR2GRAY)
 
 h, w = old_gray.shape
 
-sample_points = create_sample_points(w, h)
-
-p0 = detect_features(old_gray)
-
-if p0 is None:
-    raise RuntimeError("İlk frame üzerinde takip edilecek feature bulunamadı.")
+# Optik eksen (prensip noktası). Homografiyi burada lineerleştireceğiz:
+# yere dik bakan kamerada tam altındaki yer noktası bu piksele düşer, böylece
+# dönme/ölçek etkisi ayrışır ve geriye saf öteleme kalır.
+optical_center = np.array([K[0, 2], K[1, 2]], dtype=np.float64)
 
 
-# Görselleştirme ayarları
+def homography_local_motion(H, center):
+    """H'yi 'center' (optik eksen) etrafında birinci mertebeden lineerleştirir.
+
+    Döner: (theta_rad, scale, feature_disp[2]) — o noktadaki lokal dönme, ölçek
+    ve yer noktasının kayması. decomposeHomographyMat'ın 4-çözüm belirsizliği
+    olmadan yaw/ölçek/ötelemeyi tek noktadan verir.
+    """
+    cx = float(center[0])
+    cy = float(center[1])
+    wq = H[2, 0] * cx + H[2, 1] * cy + H[2, 2]
+    if abs(wq) < 1e-12:
+        return 0.0, 1.0, np.zeros(2, dtype=np.float64)
+    u = (H[0, 0] * cx + H[0, 1] * cy + H[0, 2]) / wq
+    v = (H[1, 0] * cx + H[1, 1] * cy + H[1, 2]) / wq
+    # Jacobian (2x2) 'center' noktasında
+    dudx = (H[0, 0] - u * H[2, 0]) / wq
+    dudy = (H[0, 1] - u * H[2, 1]) / wq
+    dvdx = (H[1, 0] - v * H[2, 0]) / wq
+    dvdy = (H[1, 1] - v * H[2, 1]) / wq
+    # En yakın dönme (polar) ve ölçek (alan karekökü)
+    theta = np.arctan2(dvdx - dudy, dudx + dvdy)
+    scale = np.sqrt(abs(dudx * dvdy - dudy * dvdx))
+    feature_disp = np.array([u - cx, v - cy], dtype=np.float64)
+    return float(theta), float(scale), feature_disp
+
+
+# Görselleştirme
 arrow_color = (0, 0, 255)
 point_color = (0, 255, 255)
-arrow_thickness = 3
-arrow_tip_length = 0.45
-arrow_scale = 3.0
+arrow_thickness = 2
+arrow_tip_length = 0.35
 min_motion_threshold = 0.5
 
-
-# Filtre / Homography ayarları
+# Filtre / Homografi ayarları
 min_homography_points = 30
-fb_error_threshold = 1.5
-homography_ransac_threshold = 3.0
-homography_reprojection_error = 2.5
+min_track_points = 30
+fb_error_threshold = 2.0
+homography_ransac_threshold = 3.0      # homografi similarity'den daha esnek eşik
+homography_reproj_error = 2.5          # ikinci temizlik reprojection eşiği (px)
 
+# Düz uçuşta gerçek yaw 0'dır; keyframe başına bu eşiğin altındaki yaw'ı
+# gürültü/bias sayıp atıyoruz.
+yaw_deadband_deg = 0.10
+# Görüntü dönüşü drone yaw'ının tersidir; ekranda ters görünürse +1.0 yap.
+YAW_SIGN = -1.0
 
-# Global Homography
-global_H = np.eye(3, dtype=np.float64)
+# Keyframe yenileme eşikleri
+reanchor_flow_px = 250.0
+reanchor_yaw_deg = 15.0
+reanchor_scale_lo = 0.85
+reanchor_scale_hi = 1.18
 
-global_dx_px = 0.0
-global_dy_px = 0.0
+# Aktif keyframe: orijinal nokta konumları (sabit referans)
+kf_pts0 = detect_features(old_gray)
+if kf_pts0 is None:
+    raise RuntimeError("İlk frame üzerinde takip edilecek feature bulunamadı.")
 
-global_angle_deg = 0.0
-global_scale = 1.0
+prev_gray = old_gray.copy()
+prev_pts = kf_pts0.copy()
+
+# Keyframe dünya pozu (frame0 -> keyframe), iç birimde
+kf_heading_deg = 0.0
+kf_pos_x = 0.0
+kf_pos_y = 0.0
+kf_scale = 1.0                  # S = H0 / H_keyframe
+
+# Canlı poz
+map_heading_deg = 0.0
+map_x_px = 0.0
+map_y_px = 0.0
+cumulative_scale = 1.0
 
 homography_text = "Homography: waiting"
-
 prev_time = time.time()
 
+# Trajectory haritası
 map_w = 300
 map_h = 300
 map_center_x = map_w // 2
 map_center_y = map_h // 2
 draw_scale = 1.0
-trajectory = [(0.0, 0.0)]
-map_x_px = 0.0
-map_y_px = 0.0
-map_heading_deg = 0.0
 
-log_file = open("homography_features.csv", "w", newline="", encoding="utf-8")
-log_writer = csv.writer(log_file)
-log_writer.writerow([
-    "frame_index",
-    "status",
-    #"dx_px",
-    #"dy_px",
-    #"dx_h",
-    #"dy_h",
-    #"angle_deg",
-    #"scale",
-    "global_dx_px",
-    "global_dy_px",
-    "global_angle_deg",
-    "global_scale",
-    #"fb_count",
-    #"homography_inliers",
-    #"clean_inliers"
-])
+# -----------------------------------------------------------------------------
+# GT (CSV) ile kalibrasyon
+# İlk CALIB_FRAMES frame boyunca CSV değeri DOĞRU kabul edilir; aynı anda kendi
+# iç-birim tahminimiz toplanır. Handoff'ta iç-birim -> metre dönüşümü bulunur.
+# NOT: Bu CSV, çalıştırdığın video ile AYNI uçuşa ait olmalı.
+# >>> VERECEĞİN CSV'yi buraya yaz: <<<
+# -----------------------------------------------------------------------------
+GT_CSV = "/Users/mehmetyilmaz/Desktop/THYZ_2026_Ornek_Veri_1_translation_first450.csv"
+#GT_CSV = "/Users/mehmetyilmaz/Desktop/Ornek-Veri-1-RGB-translation_first450.csv"
+CALIB_FRAMES = 450
+OUT_CSV = "/Users/mehmetyilmaz/Desktop/tahmin_homog_translation.csv"
 
-frame_index = 1
+gt_x, gt_y, gt_z = load_gt_translations(GT_CSV)
+print(f"GT yuklendi: {len(gt_x)} satir, kalibrasyon ilk {CALIB_FRAMES} frame")
+
+fx = float(K[0, 0])
+
+frame_idx = 0
+calib_M = None
+calib_est = []
+calib_gt = []
+calib_scale = []
+calib_gz = []
+calib_z_raw = []
+calib_z_params = None
+calib_info = ""
+mode_text = "CALIB(GT)"
+
+H0 = None
+alt_source = ""
+
+disp_x = float(gt_x[0])
+disp_y = float(gt_y[0])
+disp_z = float(gt_z[0])
+traj_disp = [(disp_x, disp_y)]
+hist_frame = [0]
+hist_z = [disp_z]
 
 
 while True:
@@ -153,342 +205,257 @@ while True:
     frame = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
     frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    # Eğer p0 bozulduysa veya nokta sayısı azaldıysa tekrar feature seç
-    if p0 is None or len(p0) < min_homography_points:
-        p0 = detect_features(old_gray)
+    frame_idx += 1
 
-        if p0 is None:
-            write_homography_log(
-                log_writer,
-                frame_index,
-                "no_features",
-                global_dx_px=global_dx_px,
-                global_dy_px=global_dy_px,
-                global_angle_deg=global_angle_deg,
-                global_scale=global_scale
-            )
-            frame_index += 1
-            old_gray = frame_gray.copy()
-            continue
+    # Keyframe seti bozulduysa güncel kareye anchor at
+    if kf_pts0 is None or len(kf_pts0) < min_homography_points:
+        kf_pts0 = detect_features(frame_gray)
+        prev_gray = frame_gray.copy()
+        prev_pts = None if kf_pts0 is None else kf_pts0.copy()
+        kf_heading_deg = map_heading_deg
+        kf_pos_x = map_x_px
+        kf_pos_y = map_y_px
+        kf_scale = cumulative_scale
+        continue
 
-    # Bir önceki frame'de seçilen feature noktalarını yeni frame'de takip et
-    p1, st, err = cv2.calcOpticalFlowPyrLK(
-        old_gray,
-        frame_gray,
-        p0,
-        None,
-        **lk_params
-    )
-
+    # Incremental takip: prev -> current
+    p1, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, frame_gray, prev_pts, None, **lk_params)
     if p1 is None or st is None:
-        write_homography_log(
-            log_writer,
-            frame_index,
-            "optical_flow_failed",
-            global_dx_px=global_dx_px,
-            global_dy_px=global_dy_px,
-            global_angle_deg=global_angle_deg,
-            global_scale=global_scale
-        )
-        frame_index += 1
-        old_gray = frame_gray.copy()
-        p0 = detect_features(old_gray)
+        kf_pts0 = None
+        prev_gray = frame_gray.copy()
         continue
 
     # Forward-backward kontrolü
-    p0_back, st_back, err_back = cv2.calcOpticalFlowPyrLK(
-        frame_gray,
-        old_gray,
-        p1,
-        None,
-        **lk_params
-    )
-
+    p0_back, st_back, err_back = cv2.calcOpticalFlowPyrLK(frame_gray, prev_gray, p1, None, **lk_params)
     if p0_back is None or st_back is None:
-        write_homography_log(
-            log_writer,
-            frame_index,
-            "backward_flow_failed",
-            global_dx_px=global_dx_px,
-            global_dy_px=global_dy_px,
-            global_angle_deg=global_angle_deg,
-            global_scale=global_scale
-        )
-        frame_index += 1
-        old_gray = frame_gray.copy()
-        p0 = detect_features(old_gray)
+        kf_pts0 = None
+        prev_gray = frame_gray.copy()
         continue
 
-    fb_error = np.linalg.norm(p0 - p0_back, axis=2)
-
-    valid_flow = (
+    fb_error = np.linalg.norm(prev_pts - p0_back, axis=2)
+    alive = (
         (st.ravel() == 1) &
         (st_back.ravel() == 1) &
         (fb_error.ravel() < fb_error_threshold)
     )
 
-    fb_count = int(np.count_nonzero(valid_flow))
+    prev_before = prev_pts[alive]        # sadece görselleştirme (kare-kare akış)
+    kf_pts0 = kf_pts0[alive]
+    cur_pts = p1[alive]
+    tracked = int(len(cur_pts))
 
-    good_old = p0[valid_flow]
-    good_new = p1[valid_flow]
+    prev_gray = frame_gray.copy()
+    prev_pts = cur_pts
 
-    if len(good_new) < min_homography_points:
-        write_homography_log(
-            log_writer,
-            frame_index,
-            "low_tracked_points",
-            global_dx_px=global_dx_px,
-            global_dy_px=global_dy_px,
-            global_angle_deg=global_angle_deg,
-            global_scale=global_scale,
-            fb_count=fb_count
+    # -------------------------------------------------------------------------
+    # Homografi kestirimi: keyframe -> current (BÜYÜK baseline)
+    # -------------------------------------------------------------------------
+    homography_inliers = 0
+    d_yaw = 0.0
+    s_rel = 1.0
+    flow_mag = 0.0
+    homography_status = "failed"
+    reanchor = tracked < min_track_points
+
+    if tracked >= min_homography_points:
+        H, H_mask = cv2.findHomography(
+            kf_pts0, cur_pts, cv2.RANSAC, ransacReprojThreshold=homography_ransac_threshold
         )
-        frame_index += 1
-        old_gray = frame_gray.copy()
-        p0 = detect_features(old_gray)
-        continue
 
-    # Noktaları ve optical flow oklarını çiz
-    for new, old in zip(good_new, good_old):
+        if H is not None and H_mask is not None and abs(H[2, 2]) > 1e-8 \
+                and int(np.count_nonzero(H_mask)) >= min_homography_points:
+            # 1) RANSAC inlier'ları
+            inliers = H_mask.ravel() == 1
+            c_kf = kf_pts0[inliers]
+            c_cur = cur_pts[inliers]
+
+            # 2) Reprojection ile ikinci temizlik (düzlem-dışı / hareketli nesne)
+            c_kf, c_cur, _ = filter_by_homography_error(
+                H, c_kf, c_cur, max_error=homography_reproj_error
+            )
+
+            # 3) Temiz noktalarla ileri + geri homografi (simetrik bias giderme)
+            H_back = None
+            if len(c_cur) >= min_homography_points:
+                H_ref, _ = cv2.findHomography(c_kf, c_cur, 0)
+                if H_ref is not None and abs(H_ref[2, 2]) > 1e-8:
+                    H = H_ref / H_ref[2, 2]
+                H_bk, _ = cv2.findHomography(c_cur, c_kf, 0)
+                if H_bk is not None and abs(H_bk[2, 2]) > 1e-8:
+                    H_back = H_bk / H_bk[2, 2]
+
+            homography_inliers = len(c_cur)
+
+            # 4) Optik merkezde lineerleştir -> yaw/ölçek/öteleme AYNI noktadan.
+            #    Öteleme (nadir) ve ölçek aynı lineerleştirmeden geldiği için
+            #    birbiriyle tutarlı; internal = drone_disp / S tutarlı kalır.
+            theta_fwd, s_fwd, fd_fwd = homography_local_motion(H, optical_center)
+
+            # Simetrik (ileri+geri) bias giderme. İdealde theta_back=-theta_fwd,
+            # s_back=1/s_fwd; gerçekte attenuation ikisini de aynı yönde saptırır.
+            # Ortalama/geometrik ortalama ortak bias'ı birinci mertebede siler.
+            if H_back is not None:
+                theta_bk, s_bk, fd_bk = homography_local_motion(H_back, optical_center)
+                theta_img = 0.5 * (theta_fwd - theta_bk)
+                s_rel = np.sqrt(s_fwd / s_bk) if s_bk > 1e-9 else s_fwd
+                feature_disp = 0.5 * (fd_fwd - fd_bk)
+            else:
+                theta_img = theta_fwd
+                s_rel = s_fwd
+                feature_disp = fd_fwd
+
+            # Drone yaw'ı görüntü dönüşünün tersi
+            d_yaw = YAW_SIGN * np.degrees(theta_img)
+            if abs(d_yaw) < yaw_deadband_deg:
+                d_yaw = 0.0
+
+            heading_cur = kf_heading_deg + d_yaw
+            S_cur = kf_scale * s_rel
+
+            drone_disp = -feature_disp
+
+            # İrtifayı normalize et (yükseldikçe px başına daha çok mesafe)
+            internal = drone_disp / S_cur
+
+            # Mevcut (yawlanmış) kamera çerçevesinden dünya çerçevesine döndür
+            phi = np.deg2rad(heading_cur)
+            wx = internal[0] * np.cos(phi) - internal[1] * np.sin(phi)
+            wy = internal[0] * np.sin(phi) + internal[1] * np.cos(phi)
+
+            map_heading_deg = heading_cur
+            map_x_px = kf_pos_x + wx
+            map_y_px = kf_pos_y + wy
+            cumulative_scale = S_cur
+
+            homography_status = "ok"
+            homography_text = f"dyaw:{d_yaw:.2f} s:{s_rel:.3f} in:{homography_inliers}"
+
+            # Keyframe'den bu yana hareket -> re-anchor kararı
+            flows = c_cur.reshape(-1, 2) - c_kf.reshape(-1, 2)
+            flow_mag = float(np.median(np.linalg.norm(flows, axis=1)))
+
+            if (flow_mag > reanchor_flow_px or
+                    abs(d_yaw) > reanchor_yaw_deg or
+                    s_rel < reanchor_scale_lo or s_rel > reanchor_scale_hi):
+                reanchor = True
+        else:
+            homography_text = "H failed"
+            reanchor = True
+    else:
+        homography_text = f"low points tracked:{tracked}"
+        reanchor = True
+
+    # Kare-kare akış oklarını çiz
+    for new, old in zip(cur_pts, prev_before):
         a, b = new.ravel()
         c, d = old.ravel()
+        cv2.circle(frame, (int(a), int(b)), 2, point_color, -1)
+        if np.hypot(a - c, b - d) >= min_motion_threshold:
+            cv2.arrowedLine(frame, (int(c), int(d)), (int(a), int(b)),
+                            arrow_color, arrow_thickness, tipLength=arrow_tip_length)
 
-        dx = a - c
-        dy = b - d
+    # Re-anchor: canlı pozu yeni keyframe pozu olarak kilitle, yeni referans seç
+    if reanchor:
+        kf_heading_deg = map_heading_deg
+        kf_pos_x = map_x_px
+        kf_pos_y = map_y_px
+        kf_scale = cumulative_scale
+        kf_pts0 = detect_features(frame_gray)
+        prev_gray = frame_gray.copy()
+        prev_pts = None if kf_pts0 is None else kf_pts0.copy()
 
-        motion_mag = np.hypot(dx, dy)
+    # -------------------------------------------------------------------------
+    # GT / kalibrasyon: ilk CALIB_FRAMES frame GT doğru; sonra kendi tahminimiz
+    # -------------------------------------------------------------------------
+    gt_has = frame_idx < len(gt_x)
+    z_raw = 1.0 / max(cumulative_scale, 1e-9)
 
-        cv2.circle(frame, (int(c), int(d)), 3, point_color, -1)
-
-        if motion_mag < min_motion_threshold:
-            continue
-
-        end_x = int(c + dx * arrow_scale)
-        end_y = int(d + dy * arrow_scale)
-
-        cv2.arrowedLine(
-            frame,
-            (int(c), int(d)),
-            (end_x, end_y),
-            arrow_color,
-            arrow_thickness,
-            tipLength=arrow_tip_length
-        )
-
-    homography_inliers = 0
-    clean_inliers = 0
-
-    dx_px = 0.0
-    dy_px = 0.0
-
-    dx_h = 0.0
-    dy_h = 0.0
-    angle_deg = 0.0
-    scale = 1.0
-    homography_status = "failed"
-
-    # Homography hesapla
-    H_frame, H_mask = cv2.findHomography(
-        good_old,
-        good_new,
-        cv2.RANSAC,
-        ransacReprojThreshold=homography_ransac_threshold
-    )
-
-    if H_frame is not None and H_mask is not None and abs(H_frame[2, 2]) > 1e-8:
-        homography_inliers = int(np.count_nonzero(H_mask))
-
-        # 1) RANSAC inlier noktalarını al
-        h_inliers = H_mask.ravel() == 1
-        h_old = good_old[h_inliers]
-        h_new = good_new[h_inliers]
-
-        # 2) Homography reprojection error ile ikinci temizlik
-        h_old, h_new, h_errors = filter_by_homography_error(
-            H_frame,
-            h_old,
-            h_new,
-            max_error=homography_reprojection_error
-        )
-
-        clean_inliers = len(h_new)
-
-        if clean_inliers >= min_homography_points:
-            # 3) Temiz noktalarla Homography'yi tekrar hesapla
-            H_refined, _ = cv2.findHomography(h_old, h_new, 0)
-
-            if H_refined is not None and abs(H_refined[2, 2]) > 1e-8:
-                H_frame = H_refined / H_refined[2, 2]
-
-                # 4) Sadece temiz inlier noktalarından median dx/dy hesapla
-                inlier_flows = h_new.reshape(-1, 2) - h_old.reshape(-1, 2)
-
-                dx_px = np.median(inlier_flows[:, 0])
-                dy_px = np.median(inlier_flows[:, 1])
-
-                # 5) Global Homography biriktir
-                global_H = H_frame @ global_H
-
-                if abs(global_H[2, 2]) > 1e-8:
-                    global_H = global_H / global_H[2, 2]
-
-                # 6) Bu frame için hareketi 9 örnek nokta üzerinden hesapla
-                warped_points = cv2.perspectiveTransform(sample_points, H_frame)
-                motion = warped_points.reshape(-1, 2) - sample_points.reshape(-1, 2)
-
-                dx_h = np.median(motion[:, 0])
-                dy_h = np.median(motion[:, 1])
-
-                # 7) Global hareketi de 9 örnek nokta üzerinden hesapla
-                warped_global = cv2.perspectiveTransform(sample_points, global_H)
-                global_motion = warped_global.reshape(-1, 2) - sample_points.reshape(-1, 2)
-
-                global_dx_px = np.median(global_motion[:, 0])
-                global_dy_px = np.median(global_motion[:, 1])
-
-                # 8) Anlık açı ve ölçek hesabı
-                angle_deg, scale = angle_scale_from_homography(H_frame, w, h)
-
-                # 9) Global açı ve global ölçek hesabı
-                global_angle_deg, global_scale = angle_scale_from_homography(global_H, w, h)
-
-                homography_text = (
-                    f"H dx:{dx_h:.2f} dy:{dy_h:.2f} "
-                    f"ang:{angle_deg:.2f} scale:{scale:.3f} "
-                    f"in:{homography_inliers} clean:{clean_inliers}"
-                )
-                homography_status = "ok"
-
-            else:
-                homography_text = "H refine failed"
-                homography_status = "refine_failed"
-
-        else:
-            homography_text = f"H skipped clean:{clean_inliers}"
-            homography_status = "low_clean_inliers"
-
+    if frame_idx < CALIB_FRAMES and gt_has:
+        disp_x = float(gt_x[frame_idx])
+        disp_y = float(gt_y[frame_idx])
+        disp_z = float(gt_z[frame_idx])
+        mode_text = "CALIB(GT)"
+        if homography_status == "ok":
+            calib_est.append([map_x_px, map_y_px])
+            calib_gt.append([gt_x[frame_idx], gt_y[frame_idx]])
+            calib_scale.append(cumulative_scale)
+            calib_gz.append(gt_z[frame_idx])
+            calib_z_raw.append(z_raw)
     else:
-        homography_text = "H failed"
+        # Handoff: kalibrasyonu bir kez hesapla
+        if calib_M is None:
+            if len(calib_est) >= 10:
+                calib_M, _ = fit_calibration(calib_est, calib_gt)
+                rep = calibration_report(calib_M, calib_est, calib_gt)
+                print("KALIBRASYON:", rep)
 
-    # FPS hesabı
+                # --- Mutlak irtifa H0 ---
+                H0_horiz = rep["scale_m_per_unit"] * fx
+                H0_vert, u_span = fit_altitude_from_vertical(calib_scale, calib_gz)
+                print(f"IRTIFA: H0_yatay={H0_horiz:.2f}m  H0_dikey={H0_vert}  (u_span={u_span:.4f})")
+
+                if H0_vert is not None and u_span > 0.03 and H0_vert != 0:
+                    H0 = abs(H0_vert)
+                    alt_source = "vertical"
+                else:
+                    H0 = abs(H0_horiz)
+                    alt_source = "horizontal"
+                print(f"IRTIFA secildi: H0={H0:.2f}m kaynak={alt_source}")
+
+                calib_z_params = fit_z_calibration(calib_z_raw, calib_gz)
+                if calib_z_params is not None:
+                    z_rep = z_calibration_report(calib_z_params, calib_z_raw, calib_gz)
+                    print("Z KALIBRASYON:", z_rep)
+                    calib_info = f"xy_rmse:{rep['rmse_m']:.2f}m z_rmse:{z_rep['rmse_m']:.2f}m"
+                else:
+                    print("Z KALIBRASYON: yetersiz z/scale degisimi -> H0 formulu")
+                    calib_info = f"xy_rmse:{rep['rmse_m']:.2f}m z:kalib yok H0:{H0:.1f}m"
+            else:
+                calib_info = "KALIB: yetersiz nokta"
+        # Tahmin fazı: iç-birim pozumuza kalibrasyonu uygula -> metre
+        if calib_M is not None:
+            disp_x, disp_y = apply_calibration(calib_M, map_x_px, map_y_px)
+        if calib_z_params is not None:
+            disp_z = apply_z_calibration(calib_z_params, z_raw)
+        elif H0 is not None:
+            disp_z = H0 * (z_raw - 1.0)
+        mode_text = "ESTIMATE"
+
+    traj_disp.append((disp_x, disp_y))
+    hist_frame.append(frame_idx)
+    hist_z.append(disp_z)
+
+    # FPS
     curr_time = time.time()
     dt = curr_time - prev_time
     fps = 1.0 / dt if dt > 0 else 0.0
     prev_time = curr_time
 
-    write_homography_log(
-        log_writer,
-        frame_index,
-        homography_status,
-        #dx_px=dx_px,
-        #dy_px=dy_px,
-        #dx_h=dx_h,
-        #dy_h=dy_h,
-        #angle_deg=angle_deg,
-        #scale=scale,
-        global_dx_px=global_dx_px,
-        global_dy_px=global_dy_px,
-        global_angle_deg=global_angle_deg,
-        global_scale=global_scale,
-        #fb_count=fb_count,
-        #homography_inliers=homography_inliers,
-        #clean_inliers=clean_inliers
-    )
-    frame_index += 1
-
     # Ekrana yazdırma
-    cv2.putText(
-        frame,
-        f"dx inlier(px): {dx_px:.2f}",
-        (20, 35),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        (0, 255, 0),
-        2
-    )
+    cv2.putText(frame, f"FPS: {fps:.2f}", (20, 35),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    cv2.putText(frame, homography_text, (20, 70),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+    cv2.putText(frame, f"[{mode_text}] pos x:{disp_x:.2f} y:{disp_y:.2f} z:{disp_z:.2f} m", (20, 105),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+    cv2.putText(frame, f"internal x:{map_x_px:.1f} y:{map_y_px:.1f}", (20, 138),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 2)
+    cv2.putText(frame, f"heading:{map_heading_deg:.2f} cumScale:{cumulative_scale:.3f}", (20, 171),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+    cv2.putText(frame, f"track:{tracked} in:{homography_inliers} flow:{flow_mag:.1f}px", (20, 204),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    cv2.putText(frame, calib_info, (20, 237),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
 
-    cv2.putText(
-        frame,
-        f"dy inlier(px): {dy_px:.2f}",
-        (20, 70),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        (0, 255, 0),
-        2
-    )
-
-    cv2.putText(
-        frame,
-        f"FPS: {fps:.2f}",
-        (20, 105),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        (0, 255, 0),
-        2
-    )
-
-    cv2.putText(
-        frame,
-        homography_text,
-        (20, 140),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        (255, 0, 0),
-        2
-    )
-
-    cv2.putText(
-        frame,
-        f"global px x:{global_dx_px:.2f} y:{global_dy_px:.2f}",
-        (20, 175),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        (255, 0, 0),
-        2
-    )
-
-    cv2.putText(
-        frame,
-        f"pts fb:{fb_count} H:{homography_inliers} clean:{clean_inliers}",
-        (20, 210),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        (0, 255, 255),
-        2
-    )
-
-    cv2.putText(
-    frame,
-    f"global ang:{global_angle_deg:.2f} scale:{global_scale:.3f}",
-    (20, 245),
-    cv2.FONT_HERSHEY_SIMPLEX,
-    0.65,
-    (255, 0, 255),
-    2
-)
-
-    if homography_status == "ok":
-        heading_rad = np.deg2rad(map_heading_deg)
-        rotated_dx = dx_h * np.cos(heading_rad) - dy_h * np.sin(heading_rad)
-        rotated_dy = dx_h * np.sin(heading_rad) + dy_h * np.cos(heading_rad)
-
-        map_x_px += rotated_dx
-        map_y_px += rotated_dy
-        map_heading_deg += angle_deg
-
-        if map_heading_deg > 180.0:
-            map_heading_deg -= 360.0
-        elif map_heading_deg < -180.0:
-            map_heading_deg += 360.0
-
-        trajectory.append((map_x_px, map_y_px))
-
+    # -------------------------------------------------------------------------
+    # Trajectory haritası
+    # -------------------------------------------------------------------------
     traj_map = np.zeros((map_h, map_w, 3), dtype=np.uint8)
     current_draw_scale = draw_scale
 
-    if len(trajectory) > 1:
-        traj_xs = [p[0] for p in trajectory]
-        traj_ys = [p[1] for p in trajectory]
+    if len(traj_disp) > 1:
+        traj_xs = [p[0] for p in traj_disp]
+        traj_ys = [p[1] for p in traj_disp]
         max_abs_x = max(abs(min(traj_xs)), abs(max(traj_xs)), 1.0)
         max_abs_y = max(abs(min(traj_ys)), abs(max(traj_ys)), 1.0)
         usable_half = min(map_w, map_h) * 0.45
@@ -496,59 +463,21 @@ while True:
 
     cv2.line(traj_map, (0, map_center_y), (map_w, map_center_y), (80, 80, 80), 1)
     cv2.line(traj_map, (map_center_x, 0), (map_center_x, map_h), (80, 80, 80), 1)
-
     cv2.circle(traj_map, (map_center_x, map_center_y), 4, (0, 255, 255), -1)
-    cv2.putText(
-        traj_map,
-        "(0,0)",
-        (map_center_x + 5, map_center_y - 5),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.4,
-        (0, 255, 255),
-        1
-    )
 
-    for i in range(1, len(trajectory)):
-        x1, y1 = trajectory[i - 1]
-        x2, y2 = trajectory[i]
-
+    for i in range(1, len(traj_disp)):
+        x1, y1 = traj_disp[i - 1]
+        x2, y2 = traj_disp[i]
         px1 = int(map_center_x + x1 * current_draw_scale)
         py1 = int(map_center_y - y1 * current_draw_scale)
         px2 = int(map_center_x + x2 * current_draw_scale)
         py2 = int(map_center_y - y2 * current_draw_scale)
-
         if 0 <= px1 < map_w and 0 <= py1 < map_h and 0 <= px2 < map_w and 0 <= py2 < map_h:
             cv2.line(traj_map, (px1, py1), (px2, py2), (0, 0, 255), 2)
 
-    last_x, last_y = trajectory[-1]
-    last_px = int(map_center_x + last_x * current_draw_scale)
-    last_py = int(map_center_y - last_y * current_draw_scale)
-
-    if 0 <= last_px < map_w and 0 <= last_py < map_h:
-        cv2.circle(traj_map, (last_px, last_py), 4, (255, 0, 0), -1)
-
-        heading_rad = np.deg2rad(map_heading_deg)
-        arrow_len = 30
-        heading_end_x = int(last_px + arrow_len * np.cos(heading_rad))
-        heading_end_y = int(last_py - arrow_len * np.sin(heading_rad))
-        cv2.arrowedLine(
-            traj_map,
-            (last_px, last_py),
-            (heading_end_x, heading_end_y),
-            (0, 255, 0),
-            2,
-            tipLength=0.35
-        )
-
-    cv2.putText(
-        traj_map,
-        f"x:{last_x:.1f}px y:{last_y:.1f}px head:{map_heading_deg:.1f}",
-        (15, 25),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        (255, 255, 255),
-        1
-    )
+    last_x, last_y = traj_disp[-1]
+    cv2.putText(traj_map, f"x:{last_x:.1f} y:{last_y:.1f} head:{map_heading_deg:.1f}",
+                (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
     cv2.imshow("frame", frame)
     cv2.imshow("trajectory", traj_map)
@@ -557,14 +486,65 @@ while True:
     if k == 27:
         break
 
-    # Bir sonraki frame için referans görüntü ve feature noktalarını güncelle
-    old_gray = frame_gray.copy()
-    p0 = detect_features(old_gray)
-
-    if p0 is None:
-        homography_text = "No features"
-        continue
-
-log_file.close()
 cap.release()
 cv2.destroyAllWindows()
+
+
+# -----------------------------------------------------------------------------
+# Çıktı CSV: her frame için x, y, z (GT ile aynı format)
+# İlk CALIB_FRAMES frame = GT; sonrası = tahmin. Atlanan frame olursa son bilinen
+# değer ileri taşınır.
+# -----------------------------------------------------------------------------
+frame_data = {}
+for i in range(len(traj_disp)):
+    f = hist_frame[i]
+    x, y = traj_disp[i]
+    z = float(hist_z[i])
+    frame_data[f] = (float(x), float(y), z)
+
+max_f = max(frame_data) if frame_data else 0
+with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
+    wr = csv.writer(f)
+    wr.writerow(["translation_x", "translation_y", "translation_z", "frame_numbers"])
+    last = (0.0, 0.0, 0.0)
+    for fi in range(max_f + 1):
+        if fi in frame_data:
+            last = frame_data[fi]
+        x, y, z = last
+        wr.writerow([x, y, z, fi])
+print(f"{OUT_CSV} yazildi: {max_f + 1} frame")
+
+
+# -----------------------------------------------------------------------------
+# Video bitince: yörünge + irtifa grafiği
+# -----------------------------------------------------------------------------
+est = np.array(traj_disp, dtype=np.float64)
+gt_calib = np.stack([gt_x[:CALIB_FRAMES], gt_y[:CALIB_FRAMES]], axis=1)
+
+fig, axs = plt.subplots(1, 2, figsize=(14, 6))
+
+axs[0].plot(est[:, 0], est[:, 1], "-", color="red", linewidth=1.5, label="Tahmin (metrik)")
+axs[0].plot(gt_calib[:, 0], gt_calib[:, 1], "-", color="tab:blue", linewidth=1.5,
+            label=f"GT (ilk {CALIB_FRAMES})")
+axs[0].scatter([est[0, 0]], [est[0, 1]], c="black", s=40, zorder=5, label="Başlangıç")
+axs[0].scatter([est[-1, 0]], [est[-1, 1]], c="green", s=40, zorder=5, label="Son")
+axs[0].set_aspect("equal", adjustable="datalim")
+axs[0].set_xlabel("x (m)")
+axs[0].set_ylabel("y (m)")
+axs[0].set_title("Homografi - yörünge")
+axs[0].grid(True, alpha=0.3)
+axs[0].legend()
+
+axs[1].plot(hist_frame, hist_z, "-", color="tab:green", linewidth=1.5, label="Tahmin/ekran z")
+gt_plot_n = min(len(gt_z), max(hist_frame) + 1)
+if gt_plot_n > 0:
+    axs[1].plot(range(gt_plot_n), gt_z[:gt_plot_n], "--", color="tab:blue", linewidth=1.2, label="GT z")
+axs[1].axvline(CALIB_FRAMES, color="gray", linestyle="--", alpha=0.7, label="kalibrasyon sonu")
+axs[1].set_title("Z tahmini")
+axs[1].legend()
+axs[1].set_xlabel("frame")
+axs[1].set_ylabel("z (m)")
+axs[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()

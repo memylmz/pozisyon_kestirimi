@@ -65,14 +65,18 @@ def angle_scale_from_homography(H, w, h, line_len=100):
 
 
 # Bize gelen kamera verilerine göre uygun kamera parametrelerini seçeceğiz.
+# NOT (MATLAB -> OpenCV): MATLAB Camera Calibrator 1-tabanlı piksel indeksler
+# (ilk piksel merkezi (1,1)), OpenCV 0-tabanlı. Prensip noktası OpenCV'ye
+# geçerken cx-1, cy-1 olur (odak ve distortion aynen kalır). Aşağıdaki cx,cy
+# MATLAB PrincipalPoint'ten 1 çıkarılmış halidir.
 CALIBRATIONS = [
     {
         "name": "RGB 1080p",
         "h": 1080,
         "w": 1920,
         "K": np.array([
-            [1389.7, 0.0, 954.007],
-            [0.0, 1387.1, 558.896],
+            [1389.7, 0.0, 953.007],     # cx = 954.007 - 1
+            [0.0, 1387.1, 557.896],     # cy = 558.896 - 1
             [0.0, 0.0, 1.0]
         ], dtype=np.float32),
         "dist": np.array([0.1378, -0.2564, 0.0, 0.0, 0.0], dtype=np.float32)
@@ -82,8 +86,8 @@ CALIBRATIONS = [
         "h": 3000,
         "w": 4000,
         "K": np.array([
-            [2792.2, 0.0, 1988.0],
-            [0.0, 2795.2, 1562.2],
+            [2792.2, 0.0, 1987.0],      # cx = 1988.0 - 1
+            [0.0, 2795.2, 1561.2],      # cy = 1562.2 - 1
             [0.0, 0.0, 1.0]
         ], dtype=np.float32),
         "dist": np.array([0.0798, -0.1867, 0.0, 0.0, 0.0], dtype=np.float32)
@@ -93,8 +97,8 @@ CALIBRATIONS = [
         "h": 512,
         "w": 640,
         "K": np.array([
-            [731.7965, 0.0, 319.2367],
-            [0.0, 732.0172, 251.2424],
+            [731.7965, 0.0, 318.2367],  # cx = 319.2367 - 1
+            [0.0, 732.0172, 250.2424],  # cy = 251.2424 - 1
             [0.0, 0.0, 1.0]
         ], dtype=np.float32),
         "dist": np.array([-0.3507, 0.1137, 0.0, 0.0, 0.0], dtype=np.float32)
