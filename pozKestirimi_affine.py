@@ -1,62 +1,18 @@
 import  numpy as np
 import cv2
 import time
+import csv
 
-from yardımcı_fonksiyonlar_affine import *
-from kalibrasyon import load_gt_translations, fit_calibration, calibration_report, apply_calibration
+import matplotlib.pyplot as plt
 
-# bize gelen kamera veirlerine gör euygun kamera paremetrelerini seçeceğiz ve ona göre işlem yapacağız.
-CALIBRATIONS = [
-    {
-        "name": "RGB 1080p",
-        "h": 1080,
-        "w": 1920,
-        "K": np.array([
-            [1389.7, 0.0, 954.007],
-            [0.0, 1387.1, 558.896],
-            [0.0, 0.0, 1.0]
-        ], dtype=np.float32),
-        "dist": np.array([0.1378, -0.2564, 0.0, 0.0, 0.0], dtype=np.float32)
-    },
-    {
-        "name": "RGB 4K",
-        "h": 3000,
-        "w": 4000,
-        "K": np.array([
-            [2792.2, 0.0, 1988.0],
-            [0.0, 2795.2, 1562.2],
-            [0.0, 0.0, 1.0]
-        ], dtype=np.float32),
-        "dist": np.array([0.0798, -0.1867, 0.0, 0.0, 0.0], dtype=np.float32)
-    },
-    {
-    "name": "Thermal 640x512",
-    "h": 512,
-    "w": 640,
-    "K": np.array([
-        [731.7965, 0.0, 319.2367],
-        [0.0, 732.0172, 251.2424],
-        [0.0, 0.0, 1.0]
-    ], dtype=np.float32),
-    "dist": np.array([-0.3507, 0.1137, 0.0, 0.0, 0.0], dtype=np.float32)
-}
-]
-
-def select_camera_calibration(frame_w, frame_h):
-    for calib in CALIBRATIONS:
-        if frame_w == calib["w"] and frame_h == calib["h"]:
-            return calib, 1.0, 1.0, True
-
-    frame_ratio = frame_w / frame_h
-    best = min(
-        CALIBRATIONS,
-        key=lambda calib: abs(frame_ratio - (calib["w"] / calib["h"]))
-    )
-    sx = frame_w / best["w"]
-    sy = frame_h / best["h"]
-    same_aspect = abs(sx - sy) < 1e-3
-    return best, sx, sy, same_aspect
-
+from yardımcı_fonksiyonlar_affine import (
+    detect_features, CALIBRATIONS, select_camera_calibration
+)
+from kalibrasyon import (
+    load_gt_translations, fit_calibration, calibration_report,
+    apply_calibration, fit_altitude_from_vertical,
+    fit_z_calibration, apply_z_calibration, z_calibration_report
+)
 
 cap = cv2.VideoCapture("/Users/mehmetyilmaz/Desktop/THYZ_2026_Ornek_Veri_1.MP4")
 #cap = cv2.VideoCapture("/Users/mehmetyilmaz/Desktop/Ornek-Veri-1-RGB.MP4")
@@ -108,6 +64,17 @@ h, w = old_gray.shape
 # yere dik bakan kamerada tam kameranın altındaki yer noktası bu piksele düşer,
 # böylece dönme/ölçek etkisi ayrışır ve geriye saf öteleme kalır.
 optical_center = np.array([K[0, 2], K[1, 2]], dtype=np.float64)
+
+# Ölçek (irtifa) etkisinin ötelemeye SIZMAMASI için ötelemeyi zoom merkezinde
+# (kameranın tam altındaki yer noktası = nadir / genleşme odağı FOE)
+# değerlendirmek gerekir. Kamera kusursuz dik ve prensip noktası doğruysa bu
+# nokta optik merkezdir; kamerada eğim (pitch/roll) veya kalibrasyon hatası
+# varsa nadir noktası optik merkezden kayar. Bu kayma sıfır değilse saf yükselme
+# (s != 1) sahte bir x/y ötelemesi olarak sızar: feature_disp += (1-s)*(z-oc).
+# Kaymayı (piksel) buraya girersen sızıntı kalkar. (0,0) = eski davranış.
+# Doğru değeri elle aramana gerek yok: kalibrasyon sonunda tahmini basılır.
+nadir_offset = np.array([0.0, 0.0], dtype=np.float64)   # [dx, dy] piksel
+translation_center = optical_center + nadir_offset
 
 
 def affine_reproj_filter(M, old_pts, new_pts, max_err):
@@ -203,16 +170,31 @@ CALIB_FRAMES = 450
 gt_x, gt_y, gt_z = load_gt_translations(GT_CSV)
 print(f"GT yuklendi: {len(gt_x)} satir, kalibrasyon ilk {CALIB_FRAMES} frame")
 
+fx = float(K[0, 0])     # odak uzaklığı (piksel) -> mutlak irtifa için
+
 frame_idx = 0
 calib_M = None
 calib_est = []          # kalibrasyon fazında iç-birim tahmin
 calib_gt = []           # kalibrasyon fazında metrik GT
+calib_scale = []        # kalibrasyon fazında cumulative_scale (irtifa oranı)
+calib_gz = []           # kalibrasyon fazında GT dikey yer değiştirme (z)
+calib_z_raw = []        # kalibrasyon fazında 1/cumulative_scale ham z sinyali
+calib_oms = []          # kalibrasyon fazında (1 - s_rel) — nadir-offset teşhisi
+calib_fd = []           # kalibrasyon fazında feature_disp xy — nadir-offset teşhisi
+calib_z_params = None   # z_metre = a * z_raw + b
 calib_info = ""
 mode_text = "CALIB(GT)"
 
+# Mutlak irtifa
+H0 = None               # başlangıç irtifası (m); kalibrasyonda hesaplanır
+alt_source = ""         # "vertical" | "horizontal"
+
 disp_x = float(gt_x[0])
 disp_y = float(gt_y[0])
+disp_z = float(gt_z[0])
 traj_disp = [(disp_x, disp_y)]   # ekranda gösterilen metrik yörünge
+hist_frame = [0]                 # her frame video indeksi (grafik x ekseni)
+hist_z = [disp_z]                # her frame gösterilen/tahmin edilen z
 
 
 while True:
@@ -300,19 +282,38 @@ while True:
             c_kf, c_cur = affine_reproj_filter(M, c_kf, c_cur, affine_reproj_error)
 
             # 3) Temiz noktalarla tekrar (daha stabil) fit et
+            M_back = None
             if len(c_cur) >= min_affine_points:
                 M_ref, _ = cv2.estimateAffinePartial2D(c_kf, c_cur, method=cv2.LMEDS)
                 if M_ref is not None:
                     M = M_ref
+                # Ters yön (current -> keyframe). En-küçük-kareler, gürültülü
+                # kaynak noktalar yüzünden ölçek/dönmeyi sistematik olarak
+                # "zayıflatır" (attenuation bias). Bu bias her re-anchor'da
+                # çarpımsal birikip drift üretiyor; simetrik kestirimle sileriz.
+                M_back, _ = cv2.estimateAffinePartial2D(c_cur, c_kf, method=cv2.LMEDS)
 
             affine_inliers = len(c_cur)
 
             A = M[:, :2].astype(np.float64)
             t = M[:, 2].astype(np.float64)
 
-            # Keyframe'e göre görüntü dönüşü ve ölçek
-            theta_img = np.arctan2(M[1, 0], M[0, 0])
-            s_rel = np.hypot(M[0, 0], M[1, 0])
+            # Keyframe'e göre görüntü dönüşü ve ölçek (ileri yön)
+            theta_fwd = np.arctan2(M[1, 0], M[0, 0])
+            s_fwd = np.hypot(M[0, 0], M[1, 0])
+
+            # Simetrik (ileri+geri) bias giderme. İdealde theta_back = -theta_fwd
+            # ve s_back = 1/s_fwd olmalı; gerçekte attenuation ikisini de aynı
+            # yönde saptırır. Ortalama/geometrik ortalama bu ortak bias'ı birinci
+            # mertebede iptal eder -> ölçek ve yaw birikimini (drift) azaltır.
+            if M_back is not None:
+                theta_back = np.arctan2(M_back[1, 0], M_back[0, 0])
+                s_back = np.hypot(M_back[0, 0], M_back[1, 0])
+                theta_img = 0.5 * (theta_fwd - theta_back)
+                s_rel = np.sqrt(s_fwd / s_back) if s_back > 1e-9 else s_fwd
+            else:
+                theta_img = theta_fwd
+                s_rel = s_fwd
 
             # Drone yaw'ı görüntü dönüşünün tersi (YAW_SIGN ile ayarlanabilir)
             d_yaw = YAW_SIGN * np.degrees(theta_img)
@@ -324,8 +325,18 @@ while True:
             heading_cur = kf_heading_deg + d_yaw
             S_cur = kf_scale * s_rel
 
-            # Optik eksendeki yer noktasının kayması = yer hareketi; drone tersi
-            feature_disp = A @ optical_center + t - optical_center
+            # Optik eksendeki yer noktasının kayması = yer hareketi; drone tersi.
+            # Öteleme de dönme/ölçek gibi attenuation/yön bias'ı taşır; bu yüzden
+            # theta_img ve s_rel ile AYNI simetrik (ileri+geri) ortalamayı
+            # ötelemeye de uygularız -> ortak bias birinci mertebede silinir ve
+            # öteleme, yaw/ölçek ile tutarlı olur. M_back yoksa davranış ham
+            # ileri kestirimle aynıdır.
+            feature_disp = A @ translation_center + t - translation_center
+            if M_back is not None:
+                A_back = M_back[:, :2].astype(np.float64)
+                t_back = M_back[:, 2].astype(np.float64)
+                feature_disp_back = A_back @ translation_center + t_back - translation_center
+                feature_disp = 0.5 * (feature_disp - feature_disp_back)
             drone_disp = -feature_disp
 
             # İrtifayı normalize et (yükseldikçe px başına daha çok mesafe)
@@ -386,15 +397,22 @@ while True:
     # GT / kalibrasyon: ilk CALIB_FRAMES frame GT doğru; sonra kendi tahminimiz
     # -------------------------------------------------------------------------
     gt_has = frame_idx < len(gt_x)
+    z_raw = 1.0 / max(cumulative_scale, 1e-9)
 
     if frame_idx < CALIB_FRAMES and gt_has:
         # Kalibrasyon fazı: CSV değerini doğru say + eşleştirme topla
         disp_x = float(gt_x[frame_idx])
         disp_y = float(gt_y[frame_idx])
+        disp_z = float(gt_z[frame_idx])
         mode_text = "CALIB(GT)"
         if affine_status == "ok":
             calib_est.append([map_x_px, map_y_px])
             calib_gt.append([gt_x[frame_idx], gt_y[frame_idx]])
+            calib_scale.append(cumulative_scale)
+            calib_gz.append(gt_z[frame_idx])
+            calib_z_raw.append(z_raw)
+            calib_oms.append(1.0 - s_rel)
+            calib_fd.append([float(feature_disp[0]), float(feature_disp[1])])
     else:
         # Handoff: kalibrasyonu bir kez hesapla
         if calib_M is None:
@@ -407,15 +425,73 @@ while True:
                 np.savetxt("kalibrasyon_pairs.csv", pairs, delimiter=",",
                            header="est_x,est_y,gt_x,gt_y", comments="")
                 print("kalibrasyon_pairs.csv yazildi:", len(pairs), "cift")
-                calib_info = f"scale:{rep['scale_m_per_unit']:.4f}m/u rmse:{rep['rmse_m']:.2f}m refl:{rep['reflected']}"
+
+                # Nadir-offset (zoom merkezi) teşhisi. Ölçek etkisi ötelemeye
+                # sızıyorsa (yükselirken x/y kayması) feature_disp ~ d + (1-s)*(z-oc)
+                # olur; (1-s)'e regresyon eğimi ~ (z-oc) = nadir kayması (px).
+                # Basılan değeri yukarıdaki nadir_offset'e yazıp yeniden
+                # çalıştırınca sızıntı azalır; tekrar ~0 basması kalibre olduğunu
+                # gösterir. (d ile (1-s) korelasyonsuz VE kalibrasyon penceresinde
+                # irtifa yeterince değişmişse anlamlıdır; değilse "yetersiz" der.)
+                oms = np.asarray(calib_oms, dtype=np.float64)
+                fd = np.asarray(calib_fd, dtype=np.float64)
+                denom_o = float(oms @ oms)
+                oms_span = float(oms.max() - oms.min()) if len(oms) else 0.0
+                z_off = (oms @ fd) / denom_o if denom_o > 1e-9 else np.zeros(2)
+                # Güvenilirlik iki koşula bağlı: (a) kalibrasyon penceresinde
+                # ölçek yeterince değişmeli (yoksa (1-s)'e regresyon patlar ve
+                # görüntü dışına düşen anlamsız devasa bir offset üretir), (b)
+                # sonuç fiziksel olarak görüntü içinde kalmalı. Biri sağlanmazsa
+                # tahmin gürültüdür; kullanıcıyı yanlış (büyük) değere karşı uyar.
+                plausible = abs(z_off[0]) < w and abs(z_off[1]) < h
+                if len(oms) >= 10 and oms_span > 0.05 and plausible:
+                    print(f"NADIR-OFFSET tahmini (px): dx={z_off[0]:+.1f} dy={z_off[1]:+.1f}"
+                          f"  -> nadir_offset'e yaz")
+                else:
+                    print(f"NADIR-OFFSET tahmini: guvenilmez (kalibrasyonda irtifa "
+                          f"~sabit, olcek span={oms_span:.4f}); nadir_offset=(0,0) birak")
+
+                # --- Mutlak irtifa H0 ---
+                # 1) Yatay ölçekten: scale_cal = GSD0 = H0/f  ->  H0 = scale_cal * f
+                H0_horiz = rep["scale_m_per_unit"] * fx
+                # 2) Dikey kanaldan (yatay dejenerasyondan bağımsız)
+                H0_vert, u_span = fit_altitude_from_vertical(calib_scale, calib_gz)
+                print(f"IRTIFA: H0_yatay={H0_horiz:.2f}m  H0_dikey={H0_vert}  (u_span={u_span:.4f})")
+
+                # İrtifa penceresinde yeterli değişim varsa dikey kanalı tercih et
+                if H0_vert is not None and u_span > 0.03 and H0_vert != 0:
+                    H0 = abs(H0_vert)
+                    alt_source = "vertical"
+                else:
+                    H0 = abs(H0_horiz)
+                    alt_source = "horizontal"
+                print(f"IRTIFA secildi: H0={H0:.2f}m kaynak={alt_source}")
+
+                calib_z_params = fit_z_calibration(calib_z_raw, calib_gz)
+                if calib_z_params is not None:
+                    z_rep = z_calibration_report(calib_z_params, calib_z_raw, calib_gz)
+                    print("Z KALIBRASYON:", z_rep)
+                    calib_info = (
+                        f"xy_rmse:{rep['rmse_m']:.2f}m "
+                        f"z_rmse:{z_rep['rmse_m']:.2f}m"
+                    )
+                else:
+                    print("Z KALIBRASYON: yetersiz z/scale degisimi")
+                    calib_info = f"xy_rmse:{rep['rmse_m']:.2f}m z:kalib yok H0:{H0:.1f}m"
             else:
                 calib_info = "KALIB: yetersiz nokta"
         # Tahmin fazı: kendi iç-birim pozumuza kalibrasyonu uygula -> metre
         if calib_M is not None:
             disp_x, disp_y = apply_calibration(calib_M, map_x_px, map_y_px)
+        if calib_z_params is not None:
+            disp_z = apply_z_calibration(calib_z_params, z_raw)
+        elif H0 is not None:
+            disp_z = H0 * (z_raw - 1.0)
         mode_text = "ESTIMATE"
 
     traj_disp.append((disp_x, disp_y))
+    hist_frame.append(frame_idx)
+    hist_z.append(disp_z)
 
     # FPS hesabı
     curr_time = time.time()
@@ -428,7 +504,7 @@ while True:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
     cv2.putText(frame, affine_text, (20, 70),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-    cv2.putText(frame, f"[{mode_text}] pos x:{disp_x:.2f} y:{disp_y:.2f} m", (20, 105),
+    cv2.putText(frame, f"[{mode_text}] pos x:{disp_x:.2f} y:{disp_y:.2f} z:{disp_z:.2f} m", (20, 105),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
     cv2.putText(frame, f"internal x:{map_x_px:.1f} y:{map_y_px:.1f}", (20, 138),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 2)
@@ -438,6 +514,13 @@ while True:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
     cv2.putText(frame, calib_info, (20, 237),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+
+    if calib_z_params is not None:
+        z_txt = f"Z tahmin: {disp_z:.2f} m  raw:{z_raw:.4f}"
+    else:
+        z_txt = "Z tahmin: kalibrasyon bekleniyor"
+    cv2.putText(frame, z_txt, (20, 275),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 0), 2)
 
     # -------------------------------------------------------------------------
     # Trajectory haritası
@@ -498,3 +581,67 @@ while True:
 
 cap.release()
 cv2.destroyAllWindows()
+
+
+# -----------------------------------------------------------------------------
+# Çıktı CSV: her frame için x, y, z değişimi (GT ile aynı format)
+# İlk CALIB_FRAMES frame = GT; sonrası = kendi tahminimiz. z = irtifa değişimi.
+# Atlanan frame olursa son bilinen değer ileri taşınır (her frame dolu olsun).
+# -----------------------------------------------------------------------------
+OUT_CSV = "/Users/mehmetyilmaz/Desktop/tahmin_translation.csv"
+
+frame_data = {}
+for i in range(len(traj_disp)):
+    f = hist_frame[i]
+    x, y = traj_disp[i]
+    z = float(hist_z[i])
+    frame_data[f] = (float(x), float(y), z)
+
+max_f = max(frame_data) if frame_data else 0
+with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
+    wr = csv.writer(f)
+    wr.writerow(["translation_x", "translation_y", "translation_z", "frame_numbers"])
+    last = (0.0, 0.0, 0.0)
+    for fi in range(max_f + 1):
+        if fi in frame_data:
+            last = frame_data[fi]
+        x, y, z = last
+        wr.writerow([x, y, z, fi])
+print(f"{OUT_CSV} yazildi: {max_f + 1} frame")
+
+
+# -----------------------------------------------------------------------------
+# Video bitince: gerçek hareket (yörünge) + irtifa grafiği
+# -----------------------------------------------------------------------------
+est = np.array(traj_disp, dtype=np.float64)
+gt_calib = np.stack([gt_x[:CALIB_FRAMES], gt_y[:CALIB_FRAMES]], axis=1)
+
+fig, axs = plt.subplots(1, 2, figsize=(14, 6))
+
+# 1) x-y yörünge (metrik)
+axs[0].plot(est[:, 0], est[:, 1], "-", color="red", linewidth=1.5, label="Tahmin (metrik)")
+axs[0].plot(gt_calib[:, 0], gt_calib[:, 1], "-", color="tab:blue", linewidth=1.5,
+            label=f"GT (ilk {CALIB_FRAMES})")
+axs[0].scatter([est[0, 0]], [est[0, 1]], c="black", s=40, zorder=5, label="Başlangıç")
+axs[0].scatter([est[-1, 0]], [est[-1, 1]], c="green", s=40, zorder=5, label="Son")
+axs[0].set_aspect("equal", adjustable="datalim")
+axs[0].set_xlabel("x (m)")
+axs[0].set_ylabel("y (m)")
+axs[0].set_title("Gerçek hareket - yörünge")
+axs[0].grid(True, alpha=0.3)
+axs[0].legend()
+
+# 2) z (m) - frame
+axs[1].plot(hist_frame, hist_z, "-", color="tab:green", linewidth=1.5, label="Tahmin/ekran z")
+gt_plot_n = min(len(gt_z), max(hist_frame) + 1)
+if gt_plot_n > 0:
+    axs[1].plot(range(gt_plot_n), gt_z[:gt_plot_n], "--", color="tab:blue", linewidth=1.2, label="GT z")
+axs[1].axvline(CALIB_FRAMES, color="gray", linestyle="--", alpha=0.7, label="kalibrasyon sonu")
+axs[1].set_title("Z tahmini")
+axs[1].legend()
+axs[1].set_xlabel("frame")
+axs[1].set_ylabel("z (m)")
+axs[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
