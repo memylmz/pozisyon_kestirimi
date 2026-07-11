@@ -102,6 +102,27 @@ def homography_local_motion(H, center):
     return float(theta), float(scale), feature_disp
 
 
+def pointcloud_scale(P, Q):
+    """keyframe->current ölçeğini iki EŞLEŞMİŞ nokta bulutunun RMS yarıçap oranından
+    kestirir:  s = sqrt( Σ||q-q̄||² / Σ||p-p̄||² ).
+
+    Neden: eskiden ölçek tek noktada (optik merkez) homografi Jacobian'ından
+    (sqrt(s_fwd/s_bk)) alınıyordu; bu keyframe başına sistematik ~%0.3 AŞAĞI sapıp
+    yüzlerce re-anchor boyunca çarpımsal drift üretiyordu (S 1.0 -> 0.45, yörünge
+    ~2.2x şişme). Nokta bulutunun yayılım oranı tüm inlier'ları kullanır; benzerlik
+    için yansızdır, dönmeden bağımsızdır ve driften çok daha az etkilenir
+    (return-to-altitude ölçek sapması %42 -> %19).
+    """
+    P = P.reshape(-1, 2).astype(np.float64)
+    Q = Q.reshape(-1, 2).astype(np.float64)
+    pc = P - P.mean(axis=0)
+    qc = Q - Q.mean(axis=0)
+    sp2 = float(np.sum(pc ** 2))
+    if sp2 < 1e-9:
+        return 1.0
+    return float(np.sqrt(np.sum(qc ** 2) / sp2))
+
+
 # Görselleştirme
 arrow_color = (0, 0, 255)
 point_color = (0, 255, 255)
@@ -121,6 +142,14 @@ homography_reproj_error = 2.5          # ikinci temizlik reprojection eşiği (p
 yaw_deadband_deg = 0.10
 # Görüntü dönüşü drone yaw'ının tersidir; ekranda ters görünürse +1.0 yap.
 YAW_SIGN = -1.0
+
+# Z (irtifa) işaret konvansiyonu. Kalibrasyon penceresi (ilk CALIB_FRAMES) irtifa
+# açısından DÜZ olduğundan (yatay hareket >> dikey), dikey GT kanalından otomatik
+# işaret tespiti VO ölçek drifti sinyali bastırırsa yanılabilir. Bu yüzden manuel
+# override: 0.0 = otomatik tespit (np.sign(H0_vert)); +1.0/-1.0 = işareti zorla.
+# YAW_SIGN ile aynı mantık. Çalıştırınca konsoldaki 'z_isaret' GT'ye göre ters
+# görünüyorsa burayı elle ayarla. THYZ_2026_Ornek_Veri_1 GT'si aşağı-pozitif -> -1.0.
+Z_SIGN = 0.0
 
 # Keyframe yenileme eşikleri
 reanchor_flow_px = 250.0
@@ -165,10 +194,10 @@ draw_scale = 1.0
 # NOT: Bu CSV, çalıştırdığın video ile AYNI uçuşa ait olmalı.
 # >>> VERECEĞİN CSV'yi buraya yaz: <<<
 # -----------------------------------------------------------------------------
-GT_CSV = "/Users/mehmetyilmaz/Desktop/THYZ_2026_Ornek_Veri_1_translation_first450.csv"
 #GT_CSV = "/Users/mehmetyilmaz/Desktop/Ornek-Veri-1-RGB-translation_first450.csv"
+GT_CSV = "/Users/mehmetyilmaz/Desktop/THYZ_2026_Ornek_Veri_1_translation_first450.csv"
 CALIB_FRAMES = 450
-OUT_CSV = "/Users/mehmetyilmaz/Desktop/tahmin_homog_translation.csv"
+OUT_CSV = "/Users/mehmetyilmaz/Desktop/tahmin_translation.csv"
 
 gt_x, gt_y, gt_z = load_gt_translations(GT_CSV)
 print(f"GT yuklendi: {len(gt_x)} satir, kalibrasyon ilk {CALIB_FRAMES} frame")
@@ -291,18 +320,19 @@ while True:
             #    birbiriyle tutarlı; internal = drone_disp / S tutarlı kalır.
             theta_fwd, s_fwd, fd_fwd = homography_local_motion(H, optical_center)
 
-            # Simetrik (ileri+geri) bias giderme. İdealde theta_back=-theta_fwd,
-            # s_back=1/s_fwd; gerçekte attenuation ikisini de aynı yönde saptırır.
-            # Ortalama/geometrik ortalama ortak bias'ı birinci mertebede siler.
+            # YAW ve ÖTELEME için simetrik (ileri+geri) bias giderme: ideali
+            # theta_back=-theta_fwd, fd_back=-fd_fwd; ortalama ortak bias'ı birinci
+            # mertebede siler. ÖLÇEK ise artık Jacobian'dan DEĞİL, nokta bulutunun
+            # yayılım oranından alınır (aşağıdaki pointcloud_scale) — Jacobian ölçeği
+            # keyframe başına sistematik aşağı sapıp drift üretiyordu.
             if H_back is not None:
                 theta_bk, s_bk, fd_bk = homography_local_motion(H_back, optical_center)
                 theta_img = 0.5 * (theta_fwd - theta_bk)
-                s_rel = np.sqrt(s_fwd / s_bk) if s_bk > 1e-9 else s_fwd
                 feature_disp = 0.5 * (fd_fwd - fd_bk)
             else:
                 theta_img = theta_fwd
-                s_rel = s_fwd
                 feature_disp = fd_fwd
+            s_rel = pointcloud_scale(c_kf, c_cur)
 
             # Drone yaw'ı görüntü dönüşünün tersi
             d_yaw = YAW_SIGN * np.degrees(theta_img)
@@ -389,18 +419,39 @@ while True:
                 rep = calibration_report(calib_M, calib_est, calib_gt)
                 print("KALIBRASYON:", rep)
 
-                # --- Mutlak irtifa H0 ---
+                # --- Irtifa donusum kazanci H0 (ISARETLI) ---
+                # disp_z = H0 * (z_raw - 1). H0'in BUYUKLUGU baslangic irtifasi,
+                # ISARETI ise GT'nin z konvansiyonunu (yukari+ / asagi+) tasir.
+                # Onceki kod abs() aliyordu -> isaret kayboluyor, GT asagi+ ise z
+                # ters cikiyordu. Kalibrasyon penceresi irtifa acisindan DUZ oldugu
+                # icin (ilk 450 frame yarisma kurali) buyuklugu YATAY kanaldan
+                # (guvenilir), isareti DIKEY GT kanalindan aliriz.
                 H0_horiz = rep["scale_m_per_unit"] * fx
                 H0_vert, u_span = fit_altitude_from_vertical(calib_scale, calib_gz)
-                print(f"IRTIFA: H0_yatay={H0_horiz:.2f}m  H0_dikey={H0_vert}  (u_span={u_span:.4f})")
+                # np.sign(H0_vert): z_raw artarken (irtifa artarken) GT z hangi yone
+                # gidiyor? Duz pencerede bile net egilimin isaretini verir. Dikey
+                # kanalda hic sinyal yoksa +1 varsayilir (yukari+ konvansiyonu).
+                z_sign = float(np.sign(H0_vert)) if (H0_vert is not None and H0_vert != 0) else 1.0
+                print(f"IRTIFA: H0_yatay={H0_horiz:.2f}m  H0_dikey={H0_vert}  "
+                      f"(u_span={u_span:.4f})  z_isaret={z_sign:+.0f}")
 
                 if H0_vert is not None and u_span > 0.03 and H0_vert != 0:
-                    H0 = abs(H0_vert)
-                    alt_source = "vertical"
+                    # Dikey kanal iyi kosullu (irtifa penceredE degismis): buyukluk
+                    # ve isaret birlikte dikey LS fitinden (abs YOK).
+                    H0 = H0_vert
+                    alt_source = "vertical(signed)"
                 else:
-                    H0 = abs(H0_horiz)
-                    alt_source = "horizontal"
-                print(f"IRTIFA secildi: H0={H0:.2f}m kaynak={alt_source}")
+                    # Dikey duz: buyukluk yatay kanaldan, ISARET dikey kanaldan.
+                    H0 = z_sign * abs(H0_horiz)
+                    alt_source = "horizontal-mag/vertical-sign"
+
+                # Manuel override: Z_SIGN verildiyse buyuklugu koru, isareti zorla.
+                if Z_SIGN != 0.0:
+                    H0 = float(np.sign(Z_SIGN)) * abs(H0)
+                    alt_source += f"+zorla({'+' if Z_SIGN >= 0 else '-'})"
+
+                print(f"IRTIFA secildi: H0={H0:+.2f} "
+                      f"(buyukluk={abs(H0):.2f}m isaret={'+' if H0 >= 0 else '-'}) kaynak={alt_source}")
 
                 calib_z_params = fit_z_calibration(calib_z_raw, calib_gz)
                 if calib_z_params is not None:
