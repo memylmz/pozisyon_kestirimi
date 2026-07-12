@@ -42,10 +42,40 @@ def fit_calibration(est_xy, gt_xy, ransac_thresh_m=3.0):
     """
     est = np.asarray(est_xy, dtype=np.float32).reshape(-1, 1, 2)
     gt = np.asarray(gt_xy, dtype=np.float32).reshape(-1, 1, 2)
+    if len(est) < 2:
+        return None, None
+
+    # Önce mevcut davranışı koruyan tam afin modeli dene. İlk sağlıklı rota
+    # yaklaşık düz olduğunda tam afin problem rank-deficient olur ve OpenCV None
+    # döndürebilir. Bu durumda ölçek+dönme+öteleme içeren similarity modeline
+    # düşmek, konumu son GT değerinde dondurmaktan çok daha güvenlidir.
     M, inliers = cv2.estimateAffine2D(
         est, gt, method=cv2.RANSAC, ransacReprojThreshold=ransac_thresh_m
     )
-    return M, inliers
+    if is_valid_affine(M):
+        return M, inliers
+
+    M, inliers = cv2.estimateAffinePartial2D(
+        est, gt, method=cv2.RANSAC, ransacReprojThreshold=ransac_thresh_m
+    )
+    if is_valid_affine(M):
+        return M, inliers
+    return None, None
+
+
+def is_valid_affine(M):
+    """Bir 2x3 dönüşümün sonlu ve kullanılabilir olduğunu doğrular."""
+    if M is None:
+        return False
+    matrix = np.asarray(M, dtype=np.float64)
+    if matrix.shape != (2, 3) or not np.all(np.isfinite(matrix)):
+        return False
+    # Çökmüş veya aşırı kötü koşullu doğrusal bölüm, sonlu görünse bile küçük
+    # görüntü gürültüsünü devasa konum sıçramasına çevirebilir.
+    singular_values = np.linalg.svd(matrix[:, :2], compute_uv=False)
+    if singular_values[-1] <= 1e-10:
+        return False
+    return float(singular_values[0] / singular_values[-1]) < 1e6
 
 
 def calibration_report(M, est_xy, gt_xy):
