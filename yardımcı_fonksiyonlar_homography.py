@@ -72,7 +72,7 @@ def angle_scale_from_homography(H, w, h, line_len=100):
 # Eski kamera parametreleri (silinmedi; gerektiğinde geri alınabilir):
 
 
-CALIBRATIONS = [
+"""CALIBRATIONS = [
      {
          "name": "RGB 1080p",
          "h": 1080,
@@ -108,12 +108,12 @@ CALIBRATIONS = [
             ], dtype=np.float32),
          "dist": np.array([-0.3507, 0.1137, 0.0, 0.0, 0.0], dtype=np.float32)
      }
- ]
+ ]"""
 
 # Yeni MATLAB Camera Calibrator parametreleri.
 # TangentialDistortion [0, 0] ve üçüncü radyal katsayı verilmediği için
 # OpenCV sıralaması [k1, k2, p1, p2, k3] içinde kalan değerler sıfırdır.
-"""CALIBRATIONS = [
+CALIBRATIONS = [
     {
         "name": "RGB 4000x3000",
        "h": 3000,
@@ -136,7 +136,7 @@ CALIBRATIONS = [
         ], dtype=np.float32),
         "dist": np.array([-0.3507, 0.1137, 0.0, 0.0, 0.0], dtype=np.float32)
     }
-]"""
+]
 def select_camera_calibration(frame_w, frame_h):
     for calib in CALIBRATIONS:
         if frame_w == calib["w"] and frame_h == calib["h"]:

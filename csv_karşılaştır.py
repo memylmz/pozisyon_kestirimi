@@ -11,8 +11,8 @@ import numpy as np
 #   python csv_karsilastir.py birinci.csv ikinci.csv
 # CSV_1 genelde GERÇEK (GT), CSV_2 TAHMİN olarak düşünülür (etiketler ona göre).
 # -----------------------------------------------------------------------------
-#DEFAULT_CSV_1 = "/Users/mehmetyilmaz/Desktop/Ornek-Veri-1-RGB_tahmin_translation.csv"
-DEFAULT_CSV_1 = "/Users/mehmetyilmaz/Desktop/THYZ_2026_Ornek_Veri_1_translation.csv"
+DEFAULT_CSV_1 = "/Users/mehmetyilmaz/Desktop/Ornek-Veri-1-RGB_tahmin_translation.csv"
+#DEFAULT_CSV_1 = "/Users/mehmetyilmaz/Desktop/THYZ_2026_Ornek_Veri_1_translation.csv"
 DEFAULT_CSV_2 = "/Users/mehmetyilmaz/Desktop/tahmin_translation.csv"
 
 # Eşleşen frame'ler arasında kaç frame'de bir sapma (divergence) çizgisi çizilsin.

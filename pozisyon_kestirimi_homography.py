@@ -26,8 +26,8 @@ from kalibrasyon import (
 # heading/ölçek/konum dead-reckoning ve GT ile tek-seferlik metrik hizalama.
 # -----------------------------------------------------------------------------
 
-cap = cv2.VideoCapture("/Users/mehmetyilmaz/Desktop/THYZ_2026_Ornek_Veri_1.MP4")
-#cap = cv2.VideoCapture("/Users/mehmetyilmaz/Desktop/Ornek-Veri-1-RGB.MP4")
+#cap = cv2.VideoCapture("/Users/mehmetyilmaz/Desktop/THYZ_2026_Ornek_Veri_1.MP4")
+cap = cv2.VideoCapture("/Users/mehmetyilmaz/Desktop/Ornek-Veri-1-RGB.MP4")
 
 lk_params = dict(
     winSize=(21, 21),
@@ -151,11 +151,16 @@ YAW_SIGN = -1.0
 # görünüyorsa burayı elle ayarla. THYZ_2026_Ornek_Veri_1 GT'si aşağı-pozitif -> -1.0.
 Z_SIGN = 0.0
 
-# Keyframe yenileme eşikleri
-reanchor_flow_px = 250.0
-reanchor_yaw_deg = 15.0
-reanchor_scale_lo = 0.85
-reanchor_scale_hi = 1.18
+# Keyframe yenileme eşikleri. Değerler gevşetildi: keyframe daha uzun yaşar ->
+# daha az keyframe -> kalan ölçek biasının çarpımsal birikim SAYISI azalır
+# (headless testte re-anchor 235->142, return-to-altitude drift sapması %19->%16,
+# drift şişmesi 1.62x->1.54x). Bias çoğunlukla kat edilen YOLA bağlı olduğundan
+# kazanım küçüktür. Aşırı gevşetme baseline'ı büyütüp kenar feature kaybından
+# homografiyi zayıflatır; bu değerler bu veride test edilmiş dengedir.
+reanchor_flow_px = 450.0
+reanchor_yaw_deg = 20.0
+reanchor_scale_lo = 0.72
+reanchor_scale_hi = 1.35
 
 # Aktif keyframe: orijinal nokta konumları (sabit referans)
 kf_pts0 = detect_features(old_gray)
@@ -194,8 +199,8 @@ draw_scale = 1.0
 # NOT: Bu CSV, çalıştırdığın video ile AYNI uçuşa ait olmalı.
 # >>> VERECEĞİN CSV'yi buraya yaz: <<<
 # -----------------------------------------------------------------------------
-#GT_CSV = "/Users/mehmetyilmaz/Desktop/Ornek-Veri-1-RGB-translation_first450.csv"
-GT_CSV = "/Users/mehmetyilmaz/Desktop/THYZ_2026_Ornek_Veri_1_translation_first450.csv"
+GT_CSV = "/Users/mehmetyilmaz/Desktop/Ornek-Veri-1-RGB-translation_first450.csv"
+#GT_CSV = "/Users/mehmetyilmaz/Desktop/THYZ_2026_Ornek_Veri_1_translation_first450.csv"
 CALIB_FRAMES = 450
 OUT_CSV = "/Users/mehmetyilmaz/Desktop/tahmin_translation.csv"
 
